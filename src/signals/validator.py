@@ -51,6 +51,11 @@ def validate_and_build(
     if not price or price <= 0:
         return None
 
+    # ── Spot market: SHORT not possible ───────────────────────────────────────
+    if market_type == "spot" and direction == "SHORT":
+        logger.debug("Signal rejected: cannot SHORT on spot market")
+        return None
+
     # ── Counter-trend block ───────────────────────────────────────────────────
     # Reject signals that go against the EMA200 macro trend
     if COUNTER_TREND_BLOCK and ind.get("above_200") is not None:
