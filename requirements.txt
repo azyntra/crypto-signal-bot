@@ -1,0 +1,13 @@
+ccxt==4.3.89
+pandas==2.2.2
+ta==0.11.0
+numpy==1.26.4
+python-telegram-bot==21.3
+apscheduler==3.10.4
+sqlalchemy==2.0.30
+aiohttp==3.9.5
+python-dotenv==1.0.1
+pycoingecko==3.1.0
+requests==2.31.0
+colorlog==6.8.2
+aiofiles==23.2.1

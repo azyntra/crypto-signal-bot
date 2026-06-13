@@ -1,0 +1,142 @@
+"""
+validator.py — Validates a signal, computes entry zone, TP levels, and stop loss.
+Uses ATR for dynamic stop placement. Enforces minimum R:R ratio.
+"""
+from typing import Optional
+from config.settings import (
+    ATR_SL_MULTIPLIER, MIN_RR_RATIO, MIN_CONFIDENCE, MIN_INDICATORS_AGREE,
+    TP1_R, TP2_R, TP3_R
+)
+from config.logger import get_logger
+
+logger = get_logger(__name__)
+
+
+def validate_and_build(
+    score_result: dict,
+    market_type: str = "spot",
+) -> Optional[dict]:
+    """
+    Takes the output of score_scalp / score_swing and:
+    1. Checks confidence threshold
+    2. Checks minimum indicator agreement
+    3. Computes entry, TP1/TP2/TP3, stop loss
+    4. Checks minimum R:R ratio
+    Returns a complete signal dict or None if it fails validation.
+    """
+    direction  = score_result.get("direction")
+    confidence = score_result.get("confidence", 0)
+    reasons    = score_result.get("reasons", [])
+    ind        = score_result.get("indicators", {})
+
+    if not direction:
+        return None
+
+    if confidence < MIN_CONFIDENCE:
+        return None
+
+    if len(reasons) < MIN_INDICATORS_AGREE:
+        return None
+
+    price = ind.get("price")
+    atr   = ind.get("atr")
+
+    if not price or price <= 0:
+        return None
+
+    # ── Stop loss using ATR ───────────────────────────────────────────────────
+    sl_distance = (atr * ATR_SL_MULTIPLIER) if atr else (price * 0.02)
+
+    if direction == "LONG":
+        # Entry zone: slightly below current price (bid-area)
+        entry_low  = round(price * 0.999, _decimals(price))
+        entry_high = round(price * 1.001, _decimals(price))
+        stop_loss  = round(price - sl_distance, _decimals(price))
+        tp1        = round(price + sl_distance * TP1_R, _decimals(price))
+        tp2        = round(price + sl_distance * TP2_R, _decimals(price))
+        tp3        = round(price + sl_distance * TP3_R, _decimals(price))
+        risk_pct   = (price - stop_loss) / price * 100
+        tp1_pct    = (tp1 - price) / price * 100
+        tp2_pct    = (tp2 - price) / price * 100
+        tp3_pct    = (tp3 - price) / price * 100
+    else:  # SHORT
+        entry_low  = round(price * 0.999, _decimals(price))
+        entry_high = round(price * 1.001, _decimals(price))
+        stop_loss  = round(price + sl_distance, _decimals(price))
+        tp1        = round(price - sl_distance * TP1_R, _decimals(price))
+        tp2        = round(price - sl_distance * TP2_R, _decimals(price))
+        tp3        = round(price - sl_distance * TP3_R, _decimals(price))
+        risk_pct   = (stop_loss - price) / price * 100
+        tp1_pct    = (price - tp1) / price * 100
+        tp2_pct    = (price - tp2) / price * 100
+        tp3_pct    = (price - tp3) / price * 100
+
+    # R:R at TP2 (the conservative target)
+    rr_ratio = tp2_pct / risk_pct if risk_pct else 0
+
+    if rr_ratio < MIN_RR_RATIO:
+        logger.debug(f"Signal rejected: R:R {rr_ratio:.2f} < {MIN_RR_RATIO}")
+        return None
+
+    # ── Suggested leverage ────────────────────────────────────────────────────
+    leverage = _suggest_leverage(confidence, ind.get("atr_pct"), market_type)
+
+    return {
+        "direction":   direction,
+        "confidence":  confidence,
+        "reasons":     reasons,
+
+        "price":       price,
+        "entry_low":   entry_low,
+        "entry_high":  entry_high,
+
+        "tp1":         tp1,
+        "tp2":         tp2,
+        "tp3":         tp3,
+        "tp1_pct":     round(tp1_pct, 2),
+        "tp2_pct":     round(tp2_pct, 2),
+        "tp3_pct":     round(tp3_pct, 2),
+
+        "stop_loss":   stop_loss,
+        "risk_pct":    round(risk_pct, 2),
+        "rr_ratio":    round(rr_ratio, 2),
+
+        "leverage":    leverage,
+
+        "atr":         round(atr, _decimals(price)) if atr else None,
+        "rsi":         ind.get("rsi"),
+        "adx":         ind.get("adx"),
+        "vol_ratio":   ind.get("vol_ratio"),
+        "above_200":   ind.get("above_200"),
+    }
+
+
+def _suggest_leverage(confidence: float, atr_pct: Optional[float], market_type: str) -> str:
+    """Return a human-readable leverage suggestion."""
+    if market_type == "spot":
+        return "1x (spot — no leverage)"
+
+    if atr_pct and atr_pct > 5:
+        return "2–3x (high volatility)"
+    elif atr_pct and atr_pct > 2:
+        if confidence >= 85:
+            return "5–10x"
+        return "3–5x"
+    else:
+        if confidence >= 85:
+            return "10–15x"
+        return "5–10x"
+
+
+def _decimals(price: float) -> int:
+    """Return appropriate decimal places for a price."""
+    if price >= 1000:
+        return 2
+    elif price >= 10:
+        return 3
+    elif price >= 1:
+        return 4
+    elif price >= 0.01:
+        return 5
+    else:
+        return 8

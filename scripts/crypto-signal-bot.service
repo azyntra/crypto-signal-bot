@@ -1,0 +1,18 @@
+[Unit]
+Description=Crypto Signal Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/crypto-signal-bot
+ExecStart=/home/ubuntu/crypto-signal-bot/venv/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/ubuntu/crypto-signal-bot/logs/bot.log
+StandardError=append:/home/ubuntu/crypto-signal-bot/logs/bot.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
