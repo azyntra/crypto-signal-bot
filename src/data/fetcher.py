@@ -1,6 +1,12 @@
 """
 fetcher.py — Async multi-exchange OHLCV fetcher using ccxt.
 Supports Binance, Bybit, OKX, KuCoin for both spot and futures.
+
+Fixes:
+  - OKX: apiKey/secret/password must all be non-None strings (even empty)
+    to prevent ccxt from crashing with "NoneType + str" on public endpoints.
+  - Exchange instances are keyed and reused, but OKX gets explicit
+    empty-string defaults for all auth fields.
 """
 import asyncio
 from typing import Optional
@@ -10,12 +16,11 @@ import pandas as pd
 
 from config.logger import get_logger
 from config.settings import (
-    EXCHANGE_CREDENTIALS, CANDLE_LIMIT, QUOTE_CURRENCY, MIN_VOLUME_USDT
+    EXCHANGE_CREDENTIALS, CANDLE_LIMIT, QUOTE_CURRENCY,
 )
 
 logger = get_logger(__name__)
 
-# Exchange instances — created once, reused
 _exchanges: dict[str, ccxt.Exchange] = {}
 
 
@@ -23,10 +28,10 @@ def _make_exchange(name: str, market_type: str = "spot") -> ccxt.Exchange:
     """Build a ccxt exchange instance for spot or futures."""
     creds = EXCHANGE_CREDENTIALS.get(name, {}).copy()
 
-    # Override market type
+    # Set market type
     if market_type == "spot":
         creds["options"] = {"defaultType": "spot"}
-    elif market_type == "futures":
+    else:
         opts = {
             "binance": {"defaultType": "future"},
             "bybit":   {"defaultType": "linear"},
@@ -35,20 +40,25 @@ def _make_exchange(name: str, market_type: str = "spot") -> ccxt.Exchange:
         }
         creds["options"] = opts.get(name, {"defaultType": "future"})
 
-    # FIX: OKX requires a 'password' (passphrase) field to be present,
-    # even when using public/unauthenticated endpoints. Without it,
-    # ccxt's OKX implementation tries to concatenate None + str when
-    # building the request URL, causing:
-    #   "unsupported operand type(s) for +: 'NoneType' and 'str'"
+    # OKX FIX: ccxt OKX client concatenates auth strings during request
+    # signing even for public endpoints. Any None value causes:
+    #   TypeError: unsupported operand type(s) for +: 'NoneType' and 'str'
+    # All three fields must be non-None strings (empty string is fine).
     if name == "okx":
-        creds.setdefault("apiKey", "")
-        creds.setdefault("secret", "")
-        creds.setdefault("password", "")  # OKX passphrase — must not be None
+        creds["apiKey"]   = creds.get("apiKey")   or ""
+        creds["secret"]   = creds.get("secret")   or ""
+        creds["password"] = creds.get("password") or ""
 
     cls = getattr(ccxt, name, None)
     if cls is None:
         raise ValueError(f"Unknown exchange: {name}")
-    return cls(creds)
+
+    instance = cls(creds)
+
+    # Disable verbose logging from ccxt itself
+    instance.verbose = False
+
+    return instance
 
 
 async def get_exchange(name: str, market_type: str = "spot") -> ccxt.Exchange:
@@ -60,7 +70,10 @@ async def get_exchange(name: str, market_type: str = "spot") -> ccxt.Exchange:
 
 async def close_all():
     for ex in _exchanges.values():
-        await ex.close()
+        try:
+            await ex.close()
+        except Exception:
+            pass
     _exchanges.clear()
 
 
@@ -72,9 +85,8 @@ async def fetch_ohlcv(
     limit: int = CANDLE_LIMIT,
 ) -> Optional[pd.DataFrame]:
     """
-    Fetch OHLCV candles and return as a DataFrame with columns:
-    timestamp, open, high, low, close, volume
-    Returns None on failure.
+    Fetch OHLCV candles and return as a DataFrame.
+    Returns None on any failure.
     """
     try:
         ex = await get_exchange(exchange_name, market_type)
@@ -87,16 +99,16 @@ async def fetch_ohlcv(
         df = df.astype(float)
         return df
     except ccxt.NetworkError as e:
-        logger.warning(f"[{exchange_name}] Network error fetching {symbol} {timeframe}: {e}")
+        logger.warning(f"[{exchange_name}] Network error {symbol} {timeframe}: {e}")
     except ccxt.ExchangeError as e:
-        logger.debug(f"[{exchange_name}] Exchange error for {symbol} {timeframe}: {e}")
+        logger.debug(f"[{exchange_name}] Exchange error {symbol} {timeframe}: {e}")
     except Exception as e:
-        logger.error(f"[{exchange_name}] Unexpected error for {symbol} {timeframe}: {e}")
+        logger.error(f"[{exchange_name}] Unexpected error {symbol} {timeframe}: {e}")
     return None
 
 
 async def get_exchange_symbols(exchange_name: str, market_type: str = "spot") -> set[str]:
-    """Return all USDT-quoted symbols listed on the exchange."""
+    """Return all active USDT-quoted symbols on the exchange."""
     try:
         ex = await get_exchange(exchange_name, market_type)
         markets = await ex.load_markets()
@@ -105,7 +117,7 @@ async def get_exchange_symbols(exchange_name: str, market_type: str = "spot") ->
             if m.get("quote") == QUOTE_CURRENCY and m.get("active", True)
         }
     except Exception as e:
-        logger.error(f"[{exchange_name}] Failed to load markets: {e}")
+        logger.error(f"[{exchange_name}/{market_type}] Failed to load markets: {e}")
         return set()
 
 
@@ -119,16 +131,30 @@ async def get_24h_volume(exchange_name: str, symbol: str, market_type: str = "sp
         return 0.0
 
 
+async def fetch_ticker_price(exchange_name: str, symbol: str, market_type: str = "spot") -> Optional[float]:
+    """Fetch the latest price for a single symbol. Used by outcome tracker."""
+    try:
+        ex = await get_exchange(exchange_name, market_type)
+        ticker = await ex.fetch_ticker(symbol)
+        price = ticker.get("last") or ticker.get("close")
+        if price:
+            return float(price)
+        bid = ticker.get("bid")
+        ask = ticker.get("ask")
+        if bid and ask:
+            return (float(bid) + float(ask)) / 2.0
+    except Exception as e:
+        logger.debug(f"[{exchange_name}] Ticker fetch failed {symbol}: {e}")
+    return None
+
+
 async def fetch_multi_timeframe(
     exchange_name: str,
     symbol: str,
     timeframes: list[str],
     market_type: str = "spot",
 ) -> dict[str, pd.DataFrame]:
-    """
-    Fetch multiple timeframes concurrently for a single symbol.
-    Returns {timeframe: DataFrame}
-    """
+    """Fetch multiple timeframes concurrently. Returns {timeframe: DataFrame}."""
     tasks = {
         tf: fetch_ohlcv(exchange_name, symbol, tf, market_type)
         for tf in timeframes

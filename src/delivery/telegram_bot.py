@@ -260,3 +260,24 @@ def _fmt(value: Optional[float]) -> str:
     elif value >= 1:    return f"{value:.4f}"
     elif value >= 0.01: return f"{value:.5f}"
     else:               return f"{value:.8f}"
+
+
+async def send_result(text: str) -> Optional[int]:
+    """
+    Send a signal result card (TP/SL/EXPIRED) to the Telegram channel.
+    Called by the outcome tracker — bypasses the signal rate limit bucket
+    so result cards don't block new signal alerts.
+    """
+    try:
+        bot = await get_bot()
+        msg = await bot.send_message(
+            chat_id=TELEGRAM_CHANNEL_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+        logger.info(f"Result card sent (msg_id={msg.message_id})")
+        return msg.message_id
+    except TelegramError as e:
+        logger.error(f"Result send error: {e}")
+        return None
