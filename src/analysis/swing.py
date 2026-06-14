@@ -15,15 +15,15 @@ from config.logger import get_logger
 logger = get_logger(__name__)
 
 SWING_WEIGHTS = {
-    "ema_trend":   18,
-    "adx":         16,
-    "macd":        16,
-    "rsi":         10,
-    "divergence":  10,
-    "obv":          8,
-    "ema200":       8,
-    "structure":    8,   # Price structure (higher highs/lows)
-    "vwap":         6,   # VWAP confirmation
+    "ema_trend":   30,
+    "adx":         25,
+    "macd":        25,
+    "rsi":         20,
+    "divergence":  15,
+    "obv":         15,
+    "ema200":      10,
+    "structure":   10,   # Price structure (higher highs/lows)
+    "vwap":        10,   # VWAP confirmation
 }
 
 

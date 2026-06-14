@@ -14,15 +14,15 @@ from config.logger import get_logger
 logger = get_logger(__name__)
 
 SCALP_WEIGHTS = {
-    "rsi":        16,
-    "macd":       16,
-    "ema":        14,
-    "bb":         14,
-    "stoch":      10,
-    "volume":     10,
-    "divergence":  8,
-    "vwap":        6,
-    "structure":   6,
+    "rsi":        25,
+    "macd":       25,
+    "ema":        20,
+    "bb":         20,
+    "stoch":      15,
+    "volume":     15,
+    "divergence": 15,
+    "vwap":       10,
+    "structure":  10,
 }
 
 
@@ -39,12 +39,6 @@ def score_scalp(
     # ━━ MARKET REGIME GATE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     regime = ind.get("market_regime", "unknown")
     choppy_penalty = 0.8 if regime == "choppy" else 1.0
-
-    # ── Candle quality filter ─────────────────────────────────────────────────
-    body_pct = ind.get("body_pct", 0)
-    if body_pct < 0.35:
-        logger.debug("Scalp skipped: doji/indecision candle (body_pct={:.2f})".format(body_pct))
-        return _empty()
 
     long_score  = 0
     short_score = 0
