@@ -50,7 +50,7 @@ QUOTE_CURRENCY       = "USDT"
 # ── Signal quality thresholds ──────────────────────────────────────────────────
 MIN_CONFIDENCE       = float(os.getenv("MIN_CONFIDENCE", 40))
 MIN_RR_RATIO         = float(os.getenv("MIN_RR_RATIO", 1.5))
-MIN_INDICATORS_AGREE = 2      # minimum number of indicators that must agree
+MIN_INDICATORS_AGREE = 0      # minimum number of indicators that must agree
 
 # ── Indicator parameters ───────────────────────────────────────────────────────
 RSI_PERIOD           = 14
