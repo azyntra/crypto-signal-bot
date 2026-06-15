@@ -18,10 +18,19 @@ logger = get_logger(__name__)
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/coins/markets"
 
-# Stablecoins, wrapped tokens that don't give real signals
+# Stablecoins, wrapped tokens, pegged assets that don't give real signals
 BLOCKLIST = {
+    # Major USD stablecoins
     "USDT", "USDC", "BUSD", "TUSD", "DAI", "FDUSD", "USDP",
-    "WBTC", "WETH", "STETH", "CBETH", "RETH",
+    "USDE", "USDTB", "USD1", "PYUSD", "BFUSD", "EURC", "GHO",
+    "FRAX", "CRVUSD", "LUSD", "SUSD", "MIM", "GUSD", "ALUSD",
+    "EURS", "USDD", "USDJ", "USTC", "CUSD", "RSR", "FEI",
+    "USDB", "ZUSD", "HUSD", "USDX", "USDQ", "UST", "USDN",
+    "USDK", "TRIBE", "BEAN", "DOLA",
+    # Wrapped / pegged tokens (track underlying, not tradeable)
+    "WBTC", "WETH", "STETH", "CBETH", "RETH", "WSTETH", "METH",
+    "CBBTC", "LSETH", "SWETH", "WBETH", "TBTC",
+    # Low-quality / untradeable
     "BTTC",
 }
 

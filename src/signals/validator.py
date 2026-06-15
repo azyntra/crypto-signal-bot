@@ -63,10 +63,10 @@ def validate_and_build(
     # Reject signals that go against the EMA200 macro trend
     if COUNTER_TREND_BLOCK and ind.get("above_200") is not None:
         if direction == "LONG" and ind["above_200"] is False:
-            logger.info(f"Signal rejected: LONG but price < EMA200 ({price} < {ema200})")
+            logger.info(f"Signal rejected: LONG but price < EMA200 ({price} < {ind.get('ema200', '?')})")
             return None
         if direction == "SHORT" and ind["above_200"] is True:
-            logger.info(f"Signal rejected: SHORT but price > EMA200 ({price} > {ema200})")
+            logger.info(f"Signal rejected: SHORT but price > EMA200 ({price} > {ind.get('ema200', '?')})")
             return None
 
     # ── Stop loss using ATR (style-aware multiplier) ──────────────────────────

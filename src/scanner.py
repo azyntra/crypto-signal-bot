@@ -28,7 +28,7 @@ from config.logger import get_logger
 
 logger = get_logger(__name__)
 
-SCAN_EXCHANGES = ["binance", "bybit", "okx"]
+SCAN_EXCHANGES = ["binance", "bybit"]
 MARKET_TYPES   = ["spot", "futures"]
 
 

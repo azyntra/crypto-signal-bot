@@ -107,7 +107,7 @@ BREAKEVEN_TRIGGER       = 0.5    # move SL to entry when price reaches 50% of TP
 
 # ── Cooldown after consecutive losses ─────────────────────────────────────────
 LOSS_STREAK_PAUSE       = 3      # pause after N consecutive SL hits
-LOSS_STREAK_COOLDOWN_MIN = 0   # cooldown duration in minutes
+LOSS_STREAK_COOLDOWN_MIN = 30   # cooldown duration in minutes
 
 # ── Market regime thresholds ──────────────────────────────────────────────────
 # Trending: ADX > 25, BB width > 0.06 → trend-following signals only
@@ -119,7 +119,7 @@ REGIME_TRENDING_BBW     = 0.06   # BB width above this supports trend
 REGIME_RANGING_BBW      = 0.04   # BB width below this supports range
 
 # ── Adaptive confidence (win-rate feedback loop) ──────────────────────────────
-ADAPTIVE_CONFIDENCE     = True
+ADAPTIVE_CONFIDENCE     = False   # disabled: re-enable after 24-48h of clean data
 ADAPTIVE_LOOKBACK_DAYS  = 7      # look at last N days of performance
 ADAPTIVE_MIN_SIGNALS    = 5      # need at least N signals before applying penalty
 ADAPTIVE_BLOCK_WINRATE  = 10     # block direction if win rate < this %
