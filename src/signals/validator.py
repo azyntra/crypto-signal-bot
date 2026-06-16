@@ -8,7 +8,7 @@ Uses ATR for dynamic stop placement. Enforces minimum R:R ratio.
 from typing import Optional
 from config.settings import (
     ATR_SL_MULTIPLIER, ATR_SL_MULTIPLIER_SWING,
-    MIN_RR_RATIO, MIN_CONFIDENCE, MIN_INDICATORS_AGREE,
+    MIN_RR_RATIO, MIN_CONFIDENCE_SCALP, MIN_CONFIDENCE_SWING, MIN_INDICATORS_AGREE,
     TP1_R, TP2_R, TP3_R,
     COUNTER_TREND_BLOCK,
 )
@@ -39,8 +39,10 @@ def validate_and_build(
     if not direction:
         return None
 
-    if confidence < MIN_CONFIDENCE:
-        logger.info(f"Signal rejected: Confidence {confidence} < {MIN_CONFIDENCE}")
+    min_conf = MIN_CONFIDENCE_SWING if style == "swing" else MIN_CONFIDENCE_SCALP
+    
+    if confidence < min_conf:
+        logger.info(f"Signal rejected: Confidence {confidence} < {min_conf}")
         return None
 
     if len(reasons) < MIN_INDICATORS_AGREE:

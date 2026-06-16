@@ -20,8 +20,8 @@ AI_FILTER_ENABLED       = True
 AI_MODEL                = "gemini-2.5-flash"
 
 # Phase 2: ML Predictor
-ML_PREDICTOR_ENABLED    = False  # Enable after 100+ closed signals
-ML_MIN_TRAINING_SIGNALS = 100
+ML_PREDICTOR_ENABLED    = False  # Enable after 50+ closed signals
+ML_MIN_TRAINING_SIGNALS = 50
 
 # Phase 3: Market Sentiment (Fear & Greed)
 SENTIMENT_ENABLED       = True
@@ -63,7 +63,8 @@ MAX_SIGNALS_PER_HOUR = int(os.getenv("MAX_SIGNALS_PER_HOUR", 10))
 QUOTE_CURRENCY       = "USDT"
 
 # ── Signal quality thresholds ──────────────────────────────────────────────────
-MIN_CONFIDENCE       = 70.0
+MIN_CONFIDENCE_SCALP = 60.0
+MIN_CONFIDENCE_SWING = 65.0
 MIN_RR_RATIO         = 1.5
 MIN_INDICATORS_AGREE = 2      # minimum number of indicators that must agree
 
@@ -93,7 +94,7 @@ STOCH_OVERBOUGHT     = 75
 OBV_MA_PERIOD        = 20
 
 # ── Signal filters ─────────────────────────────────────────────────────────────
-COUNTER_TREND_BLOCK  = True   # block signals opposing EMA200 macro trend
+COUNTER_TREND_BLOCK  = False  # penalty instead of block for EMA200 macro trend
 SWING_HTF_REQUIRED   = True   # mandate higher-TF confirmation for swing signals
 MIN_VOLUME_USDT_SWING = float(os.getenv("MIN_VOLUME_USDT_SWING", 5_000_000))
 
@@ -134,15 +135,15 @@ REGIME_TRENDING_BBW     = 0.06   # BB width above this supports trend
 REGIME_RANGING_BBW      = 0.04   # BB width below this supports range
 
 # ── Adaptive confidence (win-rate feedback loop) ──────────────────────────────
-ADAPTIVE_CONFIDENCE     = False   # disabled: re-enable after 24-48h of clean data
+ADAPTIVE_CONFIDENCE     = True    # enabled to learn from recent closed signals
 ADAPTIVE_LOOKBACK_DAYS  = 7      # look at last N days of performance
 ADAPTIVE_MIN_SIGNALS    = 5      # need at least N signals before applying penalty
 ADAPTIVE_BLOCK_WINRATE  = 10     # block direction if win rate < this %
 
 # ── Support / Resistance ──────────────────────────────────────────────────────
 SR_LOOKBACK_CANDLES     = 20     # candles to look back for swing highs/lows
-SR_BLOCK_PROXIMITY_PCT  = 1.0    # block signal if < this % from S/R level
-SR_PENALTY_PROXIMITY_PCT = 2.0   # reduce score if < this % from S/R level
+SR_BLOCK_PROXIMITY_PCT  = 0.5    # block signal if < this % from S/R level
+SR_PENALTY_PROXIMITY_PCT = 1.5   # reduce score if < this % from S/R level
 
 # ── Smart coin selection ──────────────────────────────────────────────────────
 SMART_COIN_SELECTION    = True

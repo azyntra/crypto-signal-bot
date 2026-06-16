@@ -137,7 +137,7 @@ def is_on_loss_cooldown() -> bool:
             return False
 
         # Check if the last loss was recent enough for cooldown
-        last_loss_time = recent[0].closed_at
+        last_loss_time = recent[0].closed_at or recent[0].created_at
         if last_loss_time and last_loss_time.tzinfo is None:
             last_loss_time = last_loss_time.replace(tzinfo=timezone.utc)
 

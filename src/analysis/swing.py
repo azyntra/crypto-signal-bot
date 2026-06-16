@@ -4,7 +4,7 @@ Uses trend-following signals: EMA alignment, ADX trend strength, MACD,
 RSI momentum, OBV confirmation, and higher-timeframe structure.
 """
 from typing import Optional
-from config.settings import RSI_OVERSOLD, RSI_OVERBOUGHT, ADX_TREND_MIN
+from config.settings import RSI_OVERSOLD, RSI_OVERBOUGHT, ADX_TREND_MIN, SR_BLOCK_PROXIMITY_PCT, SR_PENALTY_PROXIMITY_PCT
 from config.logger import get_logger
 
 logger = get_logger(__name__)
@@ -114,13 +114,15 @@ def score_swing(
         short_score += SWING_WEIGHTS["obv"]
         short_reasons.append("OBV falling — distribution")
 
-    # ── EMA200 bias (weight 10) ───────────────────────────────────────────────
+    # ── EMA200 bias (weight 10, penalty -20) ──────────────────────────────────
     if ind.get("above_200") is True:
         long_score += SWING_WEIGHTS["ema200"]
         long_reasons.append("Price above EMA200 macro bull")
+        short_score -= 20
     elif ind.get("above_200") is False:
         short_score += SWING_WEIGHTS["ema200"]
         short_reasons.append("Price below EMA200 macro bear")
+        long_score -= 20
 
     # ── Higher TF confirmation (bonus up to +15) ──────────────────────────────
     if ind_high:
@@ -144,6 +146,25 @@ def score_swing(
             short_score = min(short_score + bonus, 100)
             if bonus >= 8:
                 short_reasons.append("Higher TF confirms trend")
+
+    # ── S/R Proximity Penalty/Block ───────────────────────────────────────────
+    price = ind.get("price")
+    res = ind.get("nearest_resistance")
+    sup = ind.get("nearest_support")
+
+    if price and res:
+        dist = (res - price) / price * 100
+        if dist < SR_BLOCK_PROXIMITY_PCT:
+            long_score = 0
+        elif dist < SR_PENALTY_PROXIMITY_PCT:
+            long_score -= 15
+
+    if price and sup:
+        dist = (price - sup) / price * 100
+        if dist < SR_BLOCK_PROXIMITY_PCT:
+            short_score = 0
+        elif dist < SR_PENALTY_PROXIMITY_PCT:
+            short_score -= 15
 
     # ── Determine direction ───────────────────────────────────────────────────
     direction  = None

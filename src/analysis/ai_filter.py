@@ -45,6 +45,9 @@ CRITICAL FILTERS — ALWAYS REJECT:
 - Price within 0.5% of a strong S/R level going against the trade
 - Volume ratio below 1.0 (below average volume)
 
+EXCEPTIONS:
+- If 3+ indicators agree strongly, APPROVE even if RSI/MACD are in neutral zones.
+
 You MUST respond with valid JSON only. No markdown, no explanation outside the JSON."""
 
 
@@ -167,7 +170,7 @@ async def review_signal(
         return fallback
 
     # Check cache
-    cache_key = f"{symbol}:{score_result.get('direction')}:{style}:{exchange}"
+    cache_key = f"{symbol}:{score_result.get('direction')}:{style}:{exchange}:{market_type}"
     now = time.time()
     if cache_key in _review_cache:
         cached_time, cached_result = _review_cache[cache_key]

@@ -106,8 +106,7 @@ def fetch_top_coins(n: int = TOP_N_COINS) -> Set[str]:
         scored_coins = []
         for coin in data:
             sym = coin.get("symbol", "").upper()
-            vol = coin.get("total_volume", 0) or 0
-            if sym and sym not in BLOCKLIST and vol >= MIN_VOLUME_USDT:
+            if sym and sym not in BLOCKLIST:
                 symbols.add(sym)
                 scored_coins.append((sym, _score_coin(coin)))
 

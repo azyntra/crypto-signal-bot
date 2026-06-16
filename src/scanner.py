@@ -25,7 +25,7 @@ from src.database.db_logger  import save_signal, is_duplicate, init_db
 
 from config.settings import (
     SCALPING_TIMEFRAMES, SWING_TIMEFRAMES, MIN_VOLUME_USDT,
-    SPOT_EXCHANGE, MIN_CONFIDENCE,
+    SPOT_EXCHANGE, MIN_CONFIDENCE_SCALP, MIN_CONFIDENCE_SWING,
 )
 from config.logger import get_logger
 
@@ -38,11 +38,26 @@ MARKET_TYPES   = ["spot", "futures"]
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def _get_pairs(exchange: str, market_type: str) -> list[str]:
+    from src.data.fetcher import get_24h_volume
     top_coins = fetch_top_coins()
     ex_symbols = await get_exchange_symbols(exchange, market_type)
     pairs = build_pairs(ex_symbols, top_coins)
-    logger.info(f"[{exchange}/{market_type}] {len(pairs)} pairs to scan")
-    return pairs
+    
+    # Filter by actual per-exchange volume
+    filtered_pairs = []
+    # Process sequentially or in small batches to avoid rate limits, but for simplicity we'll just gather
+    # To be safe against rate limits, we use a semaphore
+    sem = asyncio.Semaphore(10)
+    async def check_vol(pair):
+        async with sem:
+            vol = await get_24h_volume(exchange, pair, market_type)
+            return pair if vol >= MIN_VOLUME_USDT else None
+
+    results = await asyncio.gather(*(check_vol(p) for p in pairs))
+    filtered_pairs = [p for p in results if p]
+
+    logger.info(f"[{exchange}/{market_type}] {len(filtered_pairs)} pairs to scan (filtered from {len(pairs)})")
+    return filtered_pairs
 
 
 async def _process_scalp(exchange: str, symbol: str, market_type: str):
@@ -52,15 +67,25 @@ async def _process_scalp(exchange: str, symbol: str, market_type: str):
     if "5m" not in data:
         return
 
+    ind_1m  = compute_indicators(data.get("1m"))
     ind_5m  = compute_indicators(data.get("5m"))
     ind_15m = compute_indicators(data.get("15m"))
 
     if not ind_5m:
         return
 
-    result = score_scalp(ind_fast=ind_5m, ind_mid=ind_15m)
+    # Try 1m first
+    result = score_scalp(ind_fast=ind_1m, ind_mid=ind_5m) if ind_1m else {"direction": None}
+    if result.get("direction"):
+        tf_str = "1m"
+        dedup_window = 15
+    else:
+        # Fallback to 5m
+        result = score_scalp(ind_fast=ind_5m, ind_mid=ind_15m)
+        tf_str = "5m"
+        dedup_window = 30
 
-    if not result["direction"]:
+    if not result.get("direction"):
         return
 
     # ── Adaptive: check if direction is blocked ──────────────────────────────
@@ -98,18 +123,18 @@ async def _process_scalp(exchange: str, symbol: str, market_type: str):
     # ── Adaptive: apply confidence multiplier ────────────────────────────────
     mult = get_confidence_multiplier(signal["direction"], "scalp", exchange)
     adjusted_conf = int(signal["confidence"] * mult)
-    if adjusted_conf < MIN_CONFIDENCE:
+    if adjusted_conf < MIN_CONFIDENCE_SCALP:
         logger.debug(f"Scalp signal dropped: adaptive reduced conf {signal['confidence']}→{adjusted_conf}")
         return
     signal["confidence"] = adjusted_conf
 
-    if is_duplicate(symbol, exchange, signal["direction"], "scalp", window_minutes=30):
+    if is_duplicate(symbol, exchange, signal["direction"], "scalp", window_minutes=dedup_window):
         logger.debug(f"Duplicate scalp signal skipped: {symbol} {signal['direction']}")
         return
 
-    text = format_signal(signal, symbol, exchange, "scalp", "5m", market_type)
+    text = format_signal(signal, symbol, exchange, "scalp", tf_str, market_type)
     msg_id = await send_signal(text)
-    save_signal(signal, symbol, exchange, market_type, "scalp", "5m", msg_id, ai_review)
+    save_signal(signal, symbol, exchange, market_type, "scalp", tf_str, msg_id, ai_review)
     logger.info(f"✅ Scalp signal: {symbol} {signal['direction']} conf={signal['confidence']}%")
 
 
@@ -120,15 +145,25 @@ async def _process_swing(exchange: str, symbol: str, market_type: str):
     if "4h" not in data:
         return
 
+    ind_1h = compute_indicators(data.get("1h"))
     ind_4h = compute_indicators(data.get("4h"))
     ind_1d = compute_indicators(data.get("1d"))
 
     if not ind_4h:
         return
 
-    result = score_swing(ind_base=ind_4h, ind_high=ind_1d)
+    # Try 1h first
+    result = score_swing(ind_base=ind_1h, ind_high=ind_4h) if ind_1h else {"direction": None}
+    if result.get("direction"):
+        tf_str = "1h"
+        dedup_window = 60
+    else:
+        # Fallback to 4h
+        result = score_swing(ind_base=ind_4h, ind_high=ind_1d)
+        tf_str = "4h"
+        dedup_window = 240
 
-    if not result["direction"]:
+    if not result.get("direction"):
         return
 
     # ── Adaptive: check if direction is blocked ──────────────────────────────
@@ -166,18 +201,18 @@ async def _process_swing(exchange: str, symbol: str, market_type: str):
     # ── Adaptive: apply confidence multiplier ────────────────────────────────
     mult = get_confidence_multiplier(signal["direction"], "swing", exchange)
     adjusted_conf = int(signal["confidence"] * mult)
-    if adjusted_conf < MIN_CONFIDENCE:
+    if adjusted_conf < MIN_CONFIDENCE_SWING:
         logger.debug(f"Swing signal dropped: adaptive reduced conf {signal['confidence']}→{adjusted_conf}")
         return
     signal["confidence"] = adjusted_conf
 
-    if is_duplicate(symbol, exchange, signal["direction"], "swing", window_minutes=240):
+    if is_duplicate(symbol, exchange, signal["direction"], "swing", window_minutes=dedup_window):
         logger.debug(f"Duplicate swing signal skipped: {symbol} {signal['direction']}")
         return
 
-    text = format_signal(signal, symbol, exchange, "swing", "4h", market_type)
+    text = format_signal(signal, symbol, exchange, "swing", tf_str, market_type)
     msg_id = await send_signal(text)
-    save_signal(signal, symbol, exchange, market_type, "swing", "4h", msg_id, ai_review)
+    save_signal(signal, symbol, exchange, market_type, "swing", tf_str, msg_id, ai_review)
     logger.info(f"✅ Swing signal: {symbol} {signal['direction']} conf={signal['confidence']}%")
 
 

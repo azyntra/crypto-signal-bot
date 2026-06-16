@@ -185,25 +185,27 @@ def _detect_rsi_divergence(close: pd.Series, rsi_series: pd.Series, lookback: in
 
         # Bullish divergence: price lower low, RSI higher low
         price_min_idx = recent_close.idxmin()
-        price_min_pos = recent_close.index.get_loc(price_min_idx)
-        if price_min_pos > 0:
-            prev_low_price = recent_close.iloc[:price_min_pos].min()
-            if float(recent_close.iloc[price_min_pos]) < prev_low_price:
-                rsi_at_new_low = float(recent_rsi.iloc[price_min_pos])
-                rsi_at_prev_low = float(recent_rsi.iloc[:price_min_pos].min())
-                if rsi_at_new_low > rsi_at_prev_low and rsi_at_new_low < 40:
-                    bull_div = True
+        if pd.notna(price_min_idx):
+            price_min_pos = recent_close.index.get_loc(price_min_idx)
+            if price_min_pos > 2:
+                prev_low_price = recent_close.iloc[:price_min_pos].min()
+                if pd.notna(prev_low_price) and float(recent_close.iloc[price_min_pos]) < prev_low_price:
+                    rsi_at_new_low = float(recent_rsi.iloc[price_min_pos])
+                    rsi_at_prev_low = float(recent_rsi.iloc[:price_min_pos].min())
+                    if pd.notna(rsi_at_prev_low) and rsi_at_new_low > rsi_at_prev_low and rsi_at_new_low < 40:
+                        bull_div = True
 
         # Bearish divergence: price higher high, RSI lower high
         price_max_idx = recent_close.idxmax()
-        price_max_pos = recent_close.index.get_loc(price_max_idx)
-        if price_max_pos > 0:
-            prev_high_price = recent_close.iloc[:price_max_pos].max()
-            if float(recent_close.iloc[price_max_pos]) > prev_high_price:
-                rsi_at_new_high = float(recent_rsi.iloc[price_max_pos])
-                rsi_at_prev_high = float(recent_rsi.iloc[:price_max_pos].max())
-                if rsi_at_new_high < rsi_at_prev_high and rsi_at_new_high > 60:
-                    bear_div = True
+        if pd.notna(price_max_idx):
+            price_max_pos = recent_close.index.get_loc(price_max_idx)
+            if price_max_pos > 2:
+                prev_high_price = recent_close.iloc[:price_max_pos].max()
+                if pd.notna(prev_high_price) and float(recent_close.iloc[price_max_pos]) > prev_high_price:
+                    rsi_at_new_high = float(recent_rsi.iloc[price_max_pos])
+                    rsi_at_prev_high = float(recent_rsi.iloc[:price_max_pos].max())
+                    if pd.notna(rsi_at_prev_high) and rsi_at_new_high < rsi_at_prev_high and rsi_at_new_high > 60:
+                        bear_div = True
     except Exception:
         pass  # divergence detection is best-effort
 

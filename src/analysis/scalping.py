@@ -5,7 +5,7 @@ Stochastic, volume spike. Weights tuned for short-duration trades.
 """
 from typing import Optional
 from src.analysis.indicators import compute_indicators
-from config.settings import RSI_OVERSOLD, RSI_OVERBOUGHT, STOCH_OVERSOLD, STOCH_OVERBOUGHT
+from config.settings import RSI_OVERSOLD, RSI_OVERBOUGHT, STOCH_OVERSOLD, STOCH_OVERBOUGHT, SR_BLOCK_PROXIMITY_PCT, SR_PENALTY_PROXIMITY_PCT
 from config.logger import get_logger
 
 logger = get_logger(__name__)
@@ -111,10 +111,10 @@ def score_scalp(
     # ── Stochastic (weight 15) ────────────────────────────────────────────────
     if ind.get("stoch_k") is not None and ind.get("stoch_d") is not None:
         sk, sd = ind["stoch_k"], ind["stoch_d"]
-        if ind.get("stoch_bull") or (sk < STOCH_OVERSOLD):
+        if ind.get("stoch_bull") and (sk < STOCH_OVERSOLD):
             long_score += SCALP_WEIGHTS["stoch"]
             long_reasons.append(f"Stochastic oversold ({sk:.1f})")
-        elif ind.get("stoch_bear") or (sk > STOCH_OVERBOUGHT):
+        elif ind.get("stoch_bear") and (sk > STOCH_OVERBOUGHT):
             short_score += SCALP_WEIGHTS["stoch"]
             short_reasons.append(f"Stochastic overbought ({sk:.1f})")
 
@@ -136,6 +136,31 @@ def score_scalp(
             long_score  = min(long_score  + 8, 100)
         if conf.get("ema_bear") or (conf.get("macd_hist", 0) or 0) < 0:
             short_score = min(short_score + 8, 100)
+
+    # ── EMA200 bias penalty ───────────────────────────────────────────────────
+    if ind.get("above_200") is True:
+        short_score -= 20
+    elif ind.get("above_200") is False:
+        long_score -= 20
+
+    # ── S/R Proximity Penalty/Block ───────────────────────────────────────────
+    price = ind.get("price")
+    res = ind.get("nearest_resistance")
+    sup = ind.get("nearest_support")
+
+    if price and res:
+        dist = (res - price) / price * 100
+        if dist < SR_BLOCK_PROXIMITY_PCT:
+            long_score = 0
+        elif dist < SR_PENALTY_PROXIMITY_PCT:
+            long_score -= 15
+
+    if price and sup:
+        dist = (price - sup) / price * 100
+        if dist < SR_BLOCK_PROXIMITY_PCT:
+            short_score = 0
+        elif dist < SR_PENALTY_PROXIMITY_PCT:
+            short_score -= 15
 
     # ── Determine direction ───────────────────────────────────────────────────
     direction = None

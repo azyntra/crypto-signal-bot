@@ -26,11 +26,15 @@ _exchanges: dict[str, ccxt.Exchange] = {}
 
 def _make_exchange(name: str, market_type: str = "spot") -> ccxt.Exchange:
     """Build a ccxt exchange instance for spot or futures."""
-    creds = EXCHANGE_CREDENTIALS.get(name, {}).copy()
+    import copy
+    creds = copy.deepcopy(EXCHANGE_CREDENTIALS.get(name, {}))
 
     # Set market type
+    if "options" not in creds:
+        creds["options"] = {}
+
     if market_type == "spot":
-        creds["options"] = {"defaultType": "spot"}
+        creds["options"]["defaultType"] = "spot"
     else:
         opts = {
             "binance": {"defaultType": "future"},
@@ -38,7 +42,7 @@ def _make_exchange(name: str, market_type: str = "spot") -> ccxt.Exchange:
             "okx":     {"defaultType": "swap"},
             "kucoin":  {"defaultType": "future"},
         }
-        creds["options"] = opts.get(name, {"defaultType": "future"})
+        creds["options"].update(opts.get(name, {"defaultType": "future"}))
 
     # OKX FIX: ccxt OKX client concatenates auth strings during request
     # signing even for public endpoints. Any None value causes:
