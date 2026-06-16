@@ -12,7 +12,6 @@ unmodified (fail-open design).
 """
 import json
 import time
-import asyncio
 from typing import Optional
 
 from config.settings import (
@@ -176,6 +175,7 @@ async def review_signal(
             logger.debug(f"AI cache hit for {cache_key}")
             return cached_result
 
+    try:
         from google import genai
         from google.genai import types
 
@@ -185,66 +185,52 @@ async def review_signal(
             score_result, symbol, exchange, style, market_type, sentiment
         )
 
-        max_retries = 3
-        base_delay = 5  # seconds
-        
-        for attempt in range(max_retries):
-            try:
-                # Use the async client to avoid blocking the event loop
-                response = await client.aio.models.generate_content(
-                    model=AI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM_PROMPT,
-                        temperature=0.1,
-                        response_mime_type="application/json",
-                        response_schema=REVIEW_SCHEMA,
-                    ),
-                )
-                
-                result_text = response.text.strip()
-                result = json.loads(result_text)
+        response = client.models.generate_content(
+            model=AI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                temperature=0.1,
+                response_mime_type="application/json",
+                response_schema=REVIEW_SCHEMA,
+            ),
+        )
 
-                # Validate and sanitize
-                action = result.get("action", "APPROVE")
-                if action not in ("APPROVE", "REJECT"):
-                    action = "APPROVE"
+        result_text = response.text.strip()
+        result = json.loads(result_text)
 
-                adj_conf = result.get("adjusted_confidence", original_conf)
-                adj_conf = max(50, min(100, int(adj_conf)))
+        # Validate and sanitize
+        action = result.get("action", "APPROVE")
+        if action not in ("APPROVE", "REJECT"):
+            action = "APPROVE"
 
-                review = {
-                    "action": action,
-                    "adjusted_confidence": adj_conf,
-                    "reasoning": result.get("reasoning", ""),
-                    "risk_notes": result.get("risk_notes", ""),
-                }
+        adj_conf = result.get("adjusted_confidence", original_conf)
+        adj_conf = max(50, min(100, int(adj_conf)))
 
-                # Cache result
-                _review_cache[cache_key] = (now, review)
+        review = {
+            "action": action,
+            "adjusted_confidence": adj_conf,
+            "reasoning": result.get("reasoning", ""),
+            "risk_notes": result.get("risk_notes", ""),
+        }
 
-                # Clean old cache entries
-                expired = [k for k, (t, _) in _review_cache.items() if now - t > CACHE_TTL]
-                for k in expired:
-                    del _review_cache[k]
+        # Cache result
+        _review_cache[cache_key] = (now, review)
 
-                log_msg = (f"AI {action}: {symbol} {score_result.get('direction')} "
-                           f"conf {original_conf}→{adj_conf} | {review['reasoning']}")
-                logger.info(log_msg)
+        # Clean old cache entries
+        expired = [k for k, (t, _) in _review_cache.items() if now - t > CACHE_TTL]
+        for k in expired:
+            del _review_cache[k]
 
-                return review
-                
-            except Exception as e:
-                error_str = str(e)
-                if "429" in error_str or "TooManyRequests" in error_str or "503" in error_str:
-                    if attempt < max_retries - 1:
-                        delay = base_delay * (2 ** attempt)
-                        logger.warning(f"Gemini API rate limit hit (429/503). Retrying in {delay}s... (Attempt {attempt+1}/{max_retries})")
-                        await asyncio.sleep(delay)
-                        continue
-                
-                # If it's not a rate limit, or we're out of retries, log and fallback
-                logger.warning(f"AI filter error: {e} — signal passes through unmodified")
-                return fallback
+        log_msg = (f"AI {action}: {symbol} {score_result.get('direction')} "
+                   f"conf {original_conf}→{adj_conf} | {review['reasoning']}")
+        if action == "APPROVE":
+            logger.info(log_msg)
+        else:
+            logger.info(log_msg)
 
+        return review
 
+    except Exception as e:
+        logger.warning(f"AI filter error: {e} — signal passes through unmodified")
+        return fallback
