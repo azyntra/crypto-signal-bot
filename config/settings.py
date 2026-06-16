@@ -135,7 +135,7 @@ REGIME_TRENDING_BBW     = 0.06   # BB width above this supports trend
 REGIME_RANGING_BBW      = 0.04   # BB width below this supports range
 
 # ── Adaptive confidence (win-rate feedback loop) ──────────────────────────────
-ADAPTIVE_CONFIDENCE     = True    # enabled to learn from recent closed signals
+ADAPTIVE_CONFIDENCE     = False    # disabled: re-enable after 24-48h of clean data
 ADAPTIVE_LOOKBACK_DAYS  = 7      # look at last N days of performance
 ADAPTIVE_MIN_SIGNALS    = 5      # need at least N signals before applying penalty
 ADAPTIVE_BLOCK_WINRATE  = 10     # block direction if win rate < this %
