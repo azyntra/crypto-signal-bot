@@ -405,8 +405,11 @@ async def check_open_signals():
             _close_signal_in_db(rec.id, result, price, pnl)
 
             if _is_within_notify_window(rec):
-                msg = _build_result_message(rec, result, price, pnl)
-                await _send_result_guarded(msg)
+                if result == "SL":
+                    logger.debug(f"Signal #{rec.id} closed silently (SL hit).")
+                else:
+                    msg = _build_result_message(rec, result, price, pnl)
+                    await _send_result_guarded(msg)
             else:
                 logger.debug(f"Signal #{rec.id} closed silently (outside notify window).")
 

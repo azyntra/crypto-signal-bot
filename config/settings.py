@@ -122,8 +122,8 @@ BREAKEVEN_TRIGGER       = 0.5    # move SL to entry when price reaches 50% of TP
 # When TP3 hit → close fully
 
 # ── Cooldown after consecutive losses ─────────────────────────────────────────
-LOSS_STREAK_PAUSE       = 3      # pause after N consecutive SL hits
-LOSS_STREAK_COOLDOWN_MIN = 30   # cooldown duration in minutes
+LOSS_STREAK_PAUSE       = 10      # pause after N consecutive SL hits
+LOSS_STREAK_COOLDOWN_MIN = 0     # cooldown duration in minutes
 
 # ── Market regime thresholds ──────────────────────────────────────────────────
 # Trending: ADX > 25, BB width > 0.06 → trend-following signals only
