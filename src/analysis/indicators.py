@@ -1,10 +1,15 @@
 """
-indicators.py — Computes all technical indicators on a price DataFrame.
-v2.0: Added market regime detection, support/resistance levels,
-      price structure analysis, VWAP, and RSI divergence.
+indicators.py — Technical indicator computation (v3).
 
-Uses the `ta` library (pure-Python, arm64-compatible, no TA-Lib compile needed).
-Returns a flat dict of indicator values for the scorer to consume.
+v3 additions over v2:
+  - SuperTrend, Donchian channels, MFI, CMF (Chaikin Money Flow)
+  - Session-anchored VWAP (daily anchor — v2's "VWAP" was a 200-candle
+    cumulative average, which is not VWAP)
+  - BB-width percentile + ATR percentile (for squeeze / volatility context)
+  - EMA200 slope
+  - Candle patterns: bullish/bearish engulfing, pin bars
+  - All computed on CLOSED candles only (last row is dropped if requested)
+    so live signals never trigger off a half-formed candle.
 """
 import pandas as pd
 import numpy as np
@@ -20,16 +25,14 @@ from config.settings import (
     RSI_PERIOD, MACD_FAST, MACD_SLOW, MACD_SIGNAL,
     BB_PERIOD, BB_STD, EMA_FAST, EMA_MID, EMA_SLOW, EMA_TREND,
     ADX_PERIOD, ATR_PERIOD, STOCH_K, STOCH_D, OBV_MA_PERIOD,
-    REGIME_TRENDING_ADX, REGIME_RANGING_ADX,
-    REGIME_TRENDING_BBW, REGIME_RANGING_BBW,
-    SR_LOOKBACK_CANDLES,
+    MFI_PERIOD, CMF_PERIOD, SUPERTREND_PERIOD, SUPERTREND_MULT,
+    DONCHIAN_PERIOD, SR_LOOKBACK_CANDLES,
 )
 
 logger = get_logger(__name__)
 
 
 def _safe(series, idx=-1):
-    """Safely extract a value from a pandas Series."""
     try:
         v = series.iloc[idx]
         return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
@@ -37,377 +40,285 @@ def _safe(series, idx=-1):
         return None
 
 
-# ── Support / Resistance detection ────────────────────────────────────────────
+def _pctile_of_last(series: pd.Series, window: int = 100) -> Optional[float]:
+    """Percentile rank (0-100) of the last value within its recent window."""
+    try:
+        s = series.dropna().iloc[-window:]
+        if len(s) < 20:
+            return None
+        return float((s < s.iloc[-1]).mean() * 100)
+    except Exception:
+        return None
 
-def _detect_swing_points(high: pd.Series, low: pd.Series, lookback: int = 5):
-    """
-    Detect swing highs and swing lows using a simple pivot method.
-    A swing high: high[i] is higher than the N bars before and after it.
-    A swing low: low[i] is lower than the N bars before and after it.
-    """
-    swing_highs = []
-    swing_lows = []
+
+# ── SuperTrend ────────────────────────────────────────────────────────────────
+
+def _supertrend(high, low, close, period=SUPERTREND_PERIOD, mult=SUPERTREND_MULT):
+    """Returns (direction_series, line_series). direction: 1 bull, -1 bear."""
+    atr = tav.AverageTrueRange(high, low, close, window=period).average_true_range()
+    hl2 = (high + low) / 2
+    upper = hl2 + mult * atr
+    lower = hl2 - mult * atr
+
+    n = len(close)
+    st_dir = np.ones(n)
+    st_line = np.full(n, np.nan)
+    fu = upper.copy()
+    fl = lower.copy()
+
+    for i in range(1, n):
+        fu.iloc[i] = upper.iloc[i] if (upper.iloc[i] < fu.iloc[i-1] or close.iloc[i-1] > fu.iloc[i-1]) else fu.iloc[i-1]
+        fl.iloc[i] = lower.iloc[i] if (lower.iloc[i] > fl.iloc[i-1] or close.iloc[i-1] < fl.iloc[i-1]) else fl.iloc[i-1]
+        if st_dir[i-1] == 1:
+            st_dir[i] = -1 if close.iloc[i] < fl.iloc[i] else 1
+        else:
+            st_dir[i] = 1 if close.iloc[i] > fu.iloc[i] else -1
+        st_line[i] = fl.iloc[i] if st_dir[i] == 1 else fu.iloc[i]
+
+    return pd.Series(st_dir, index=close.index), pd.Series(st_line, index=close.index)
+
+
+# ── Session VWAP (daily anchored) ────────────────────────────────────────────
+
+def _session_vwap(df: pd.DataFrame) -> Optional[float]:
+    try:
+        today = df.index[-1].normalize()
+        session = df[df.index >= today]
+        if len(session) < 3:  # need a few candles; else use last 24h
+            session = df.iloc[-min(len(df), 96):]
+        tp = (session["high"] + session["low"] + session["close"]) / 3
+        v = session["volume"]
+        if v.sum() == 0:
+            return None
+        return float((tp * v).sum() / v.sum())
+    except Exception:
+        return None
+
+
+# ── Swing points / S-R ────────────────────────────────────────────────────────
+
+def _detect_swing_points(high: pd.Series, low: pd.Series, pivot: int = 3):
+    swing_highs, swing_lows = [], []
     n = len(high)
-    pivot = max(2, lookback // 4)  # smaller pivot for more points
-
     for i in range(pivot, n - pivot):
-        # Swing high
-        if all(high.iloc[i] >= high.iloc[i - j] for j in range(1, pivot + 1)) and \
-           all(high.iloc[i] >= high.iloc[i + j] for j in range(1, pivot + 1)):
-            swing_highs.append(float(high.iloc[i]))
-        # Swing low
-        if all(low.iloc[i] <= low.iloc[i - j] for j in range(1, pivot + 1)) and \
-           all(low.iloc[i] <= low.iloc[i + j] for j in range(1, pivot + 1)):
-            swing_lows.append(float(low.iloc[i]))
-
+        if all(high.iloc[i] >= high.iloc[i-j] for j in range(1, pivot+1)) and \
+           all(high.iloc[i] >= high.iloc[i+j] for j in range(1, pivot+1)):
+            swing_highs.append((i, float(high.iloc[i])))
+        if all(low.iloc[i] <= low.iloc[i-j] for j in range(1, pivot+1)) and \
+           all(low.iloc[i] <= low.iloc[i+j] for j in range(1, pivot+1)):
+            swing_lows.append((i, float(low.iloc[i])))
     return swing_highs, swing_lows
 
 
-def _find_nearest_sr(price: float, swing_highs: list, swing_lows: list):
-    """Find nearest resistance (above) and support (below) from swing points."""
-    resistances = sorted([h for h in swing_highs if h > price])
-    supports = sorted([l for l in swing_lows if l < price], reverse=True)
-
-    nearest_resistance = resistances[0] if resistances else None
-    nearest_support = supports[0] if supports else None
-
-    return nearest_resistance, nearest_support
+def _nearest_sr(price: float, swing_highs, swing_lows):
+    res = sorted([h for _, h in swing_highs if h > price])
+    sup = sorted([l for _, l in swing_lows if l < price], reverse=True)
+    return (res[0] if res else None), (sup[0] if sup else None)
 
 
-def _sr_risk(price: float, direction: str, nearest_resistance, nearest_support,
-             block_pct: float = 1.0, penalty_pct: float = 2.0) -> str:
-    """
-    Check if signal direction faces a nearby S/R wall.
-    LONG near resistance → risky. SHORT near support → risky.
-    Returns: "clear", "close", or "blocked"
-    """
-    if direction == "LONG" and nearest_resistance:
-        dist_pct = (nearest_resistance - price) / price * 100
-        if dist_pct < block_pct:
-            return "blocked"
-        elif dist_pct < penalty_pct:
-            return "close"
-    elif direction == "SHORT" and nearest_support:
-        dist_pct = (price - nearest_support) / price * 100
-        if dist_pct < block_pct:
-            return "blocked"
-        elif dist_pct < penalty_pct:
-            return "close"
-    return "clear"
+def _price_structure(swing_highs, swing_lows):
+    bull = bear = False
+    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
+        hh = swing_highs[-1][1] > swing_highs[-2][1]
+        hl = swing_lows[-1][1] > swing_lows[-2][1]
+        lh = swing_highs[-1][1] < swing_highs[-2][1]
+        ll = swing_lows[-1][1] < swing_lows[-2][1]
+        bull = hh and hl
+        bear = lh and ll
+    return bull, bear
 
 
-# ── Price structure (higher highs / lower lows) ──────────────────────────────
+# ── Candle patterns (on last closed candle) ──────────────────────────────────
 
-def _detect_price_structure(swing_highs: list, swing_lows: list):
-    """
-    Detect if price is making higher highs + higher lows (bull structure)
-    or lower highs + lower lows (bear structure).
-    Requires at least 3 swing points in each direction.
-    """
-    structure_bull = False
-    structure_bear = False
+def _candle_patterns(df: pd.DataFrame) -> dict:
+    o, h, l, c = df["open"], df["high"], df["low"], df["close"]
+    o1, c1 = float(o.iloc[-1]), float(c.iloc[-1])
+    o2, c2 = float(o.iloc[-2]), float(c.iloc[-2])
+    h1, l1 = float(h.iloc[-1]), float(l.iloc[-1])
+    rng = h1 - l1
+    body = abs(c1 - o1)
 
-    if len(swing_highs) >= 3 and len(swing_lows) >= 3:
-        # Check last 3 swing highs ascending
-        last_highs = swing_highs[-3:]
-        highs_ascending = last_highs[0] < last_highs[1] < last_highs[2]
+    bull_engulf = (c2 < o2) and (c1 > o1) and (c1 >= o2) and (o1 <= c2) and body > abs(c2 - o2)
+    bear_engulf = (c2 > o2) and (c1 < o1) and (c1 <= o2) and (o1 >= c2) and body > abs(c2 - o2)
 
-        # Check last 3 swing lows ascending
-        last_lows = swing_lows[-3:]
-        lows_ascending = last_lows[0] < last_lows[1] < last_lows[2]
+    lower_wick = min(o1, c1) - l1
+    upper_wick = h1 - max(o1, c1)
+    bull_pin = rng > 0 and lower_wick >= 2 * body and upper_wick <= body and lower_wick / rng > 0.6
+    bear_pin = rng > 0 and upper_wick >= 2 * body and lower_wick <= body and upper_wick / rng > 0.6
 
-        # Check last 3 swing highs descending
-        highs_descending = last_highs[0] > last_highs[1] > last_highs[2]
-        lows_descending = last_lows[0] > last_lows[1] > last_lows[2]
-
-        structure_bull = highs_ascending and lows_ascending
-        structure_bear = highs_descending and lows_descending
-
-    return structure_bull, structure_bear
-
-
-# ── Market regime classification ──────────────────────────────────────────────
-
-def _classify_regime(adx, bb_width, ema_bull, ema_bear) -> str:
-    """
-    Classify market into: "trending", "ranging", or "choppy".
-    - Trending: ADX > 25 AND (BB expanding OR EMAs aligned)
-    - Ranging:  ADX < 20 AND BB narrow
-    - Choppy:   everything else (no clear state)
-    """
-    if adx is None or bb_width is None:
-        return "unknown"
-
-    if adx > REGIME_TRENDING_ADX and (bb_width > REGIME_TRENDING_BBW or ema_bull or ema_bear):
-        return "trending"
-    elif adx < REGIME_RANGING_ADX and bb_width < REGIME_RANGING_BBW:
-        return "ranging"
-    elif adx < REGIME_RANGING_ADX:
-        return "ranging"  # low ADX even with wider bands = still rangy
-    else:
-        return "choppy"
-
-
-# ── VWAP calculation ─────────────────────────────────────────────────────────
-
-def _compute_vwap(high: pd.Series, low: pd.Series, close: pd.Series,
-                  volume: pd.Series) -> Optional[float]:
-    """Compute session VWAP (Volume-Weighted Average Price)."""
-    try:
-        typical_price = (high + low + close) / 3
-        cum_vol = volume.cumsum()
-        cum_tp_vol = (typical_price * volume).cumsum()
-        vwap_series = cum_tp_vol / cum_vol
-        val = float(vwap_series.iloc[-1])
-        return val if not np.isnan(val) else None
-    except Exception:
-        return None
-
-
-# ── RSI Divergence ───────────────────────────────────────────────────────────
-
-def _detect_rsi_divergence(close: pd.Series, rsi_series: pd.Series, lookback: int = 14):
-    """
-    Detect RSI bullish and bearish divergences.
-    Bullish: price lower low, RSI higher low (in oversold territory)
-    Bearish: price higher high, RSI lower high (in overbought territory)
-    """
-    bull_div = False
-    bear_div = False
-    div_lookback = min(lookback, len(close) - 2)
-
-    if div_lookback < 5:
-        return bull_div, bear_div
-
-    try:
-        recent_close = close.iloc[-div_lookback:]
-        recent_rsi = rsi_series.iloc[-div_lookback:]
-
-        # Bullish divergence: price lower low, RSI higher low
-        price_min_idx = recent_close.idxmin()
-        if pd.notna(price_min_idx):
-            price_min_pos = recent_close.index.get_loc(price_min_idx)
-            if price_min_pos > 2:
-                prev_low_price = recent_close.iloc[:price_min_pos].min()
-                if pd.notna(prev_low_price) and float(recent_close.iloc[price_min_pos]) < prev_low_price:
-                    rsi_at_new_low = float(recent_rsi.iloc[price_min_pos])
-                    rsi_at_prev_low = float(recent_rsi.iloc[:price_min_pos].min())
-                    if pd.notna(rsi_at_prev_low) and rsi_at_new_low > rsi_at_prev_low and rsi_at_new_low < 40:
-                        bull_div = True
-
-        # Bearish divergence: price higher high, RSI lower high
-        price_max_idx = recent_close.idxmax()
-        if pd.notna(price_max_idx):
-            price_max_pos = recent_close.index.get_loc(price_max_idx)
-            if price_max_pos > 2:
-                prev_high_price = recent_close.iloc[:price_max_pos].max()
-                if pd.notna(prev_high_price) and float(recent_close.iloc[price_max_pos]) > prev_high_price:
-                    rsi_at_new_high = float(recent_rsi.iloc[price_max_pos])
-                    rsi_at_prev_high = float(recent_rsi.iloc[:price_max_pos].max())
-                    if pd.notna(rsi_at_prev_high) and rsi_at_new_high < rsi_at_prev_high and rsi_at_new_high > 60:
-                        bear_div = True
-    except Exception:
-        pass  # divergence detection is best-effort
-
-    return bull_div, bear_div
+    return {
+        "bull_engulf": bull_engulf, "bear_engulf": bear_engulf,
+        "bull_pin": bull_pin, "bear_pin": bear_pin,
+        "body_pct": body / rng if rng else 0,
+        "candle_bull": c1 > o1,
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Main indicator computation
-# ══════════════════════════════════════════════════════════════════════════════
 
-def compute_indicators(df: pd.DataFrame) -> Optional[dict]:
+def compute_indicators(df: pd.DataFrame, drop_last: bool = True) -> Optional[dict]:
     """
-    Given an OHLCV DataFrame, compute all indicators and return a flat dict.
-    Returns None if there is not enough data.
+    Compute all indicators on an OHLCV DataFrame.
+    drop_last=True removes the currently-forming candle so every value is
+    based on closed candles only.
     """
     if df is None or len(df) < 60:
         return None
+    if drop_last:
+        df = df.iloc[:-1]
+        if len(df) < 60:
+            return None
 
     try:
-        close  = df["close"]
-        high   = df["high"]
-        low    = df["low"]
-        volume = df["volume"]
-        open_  = df["open"]
-        price  = float(close.iloc[-1])
+        close, high, low = df["close"], df["high"], df["low"]
+        volume, open_ = df["volume"], df["open"]
+        price = float(close.iloc[-1])
 
-        # ── RSI ──────────────────────────────────────────────────────────────
-        rsi_indicator = tam.RSIIndicator(close, window=RSI_PERIOD)
-        rsi_series = rsi_indicator.rsi()
+        # RSI
+        rsi_series = tam.RSIIndicator(close, window=RSI_PERIOD).rsi()
         rsi = _safe(rsi_series)
+        rsi_prev = _safe(rsi_series, -2)
 
-        # ── MACD ─────────────────────────────────────────────────────────────
-        macd_obj    = tat.MACD(close, window_fast=MACD_FAST, window_slow=MACD_SLOW, window_sign=MACD_SIGNAL)
-        macd_line   = _safe(macd_obj.macd())
-        macd_signal = _safe(macd_obj.macd_signal())
-        macd_hist   = _safe(macd_obj.macd_diff())
-        macd_prev   = _safe(macd_obj.macd(), -2)
-        macd_sig_p  = _safe(macd_obj.macd_signal(), -2)
+        # MACD
+        macd_obj = tat.MACD(close, window_fast=MACD_FAST, window_slow=MACD_SLOW, window_sign=MACD_SIGNAL)
+        macd_line, macd_sig = _safe(macd_obj.macd()), _safe(macd_obj.macd_signal())
+        macd_hist, macd_hist_prev = _safe(macd_obj.macd_diff()), _safe(macd_obj.macd_diff(), -2)
+        macd_prev, macd_sig_p = _safe(macd_obj.macd(), -2), _safe(macd_obj.macd_signal(), -2)
+        vals = [macd_line, macd_sig, macd_prev, macd_sig_p]
+        macd_cross_bull = all(v is not None for v in vals) and macd_line > macd_sig and macd_prev <= macd_sig_p
+        macd_cross_bear = all(v is not None for v in vals) and macd_line < macd_sig and macd_prev >= macd_sig_p
+        macd_hist_rising = (macd_hist is not None and macd_hist_prev is not None and macd_hist > macd_hist_prev)
 
-        macd_cross_bull = (
-            macd_line is not None and macd_signal is not None and
-            macd_prev is not None and macd_sig_p is not None and
-            macd_line > macd_signal and macd_prev < macd_sig_p
-        )
-        macd_cross_bear = (
-            macd_line is not None and macd_signal is not None and
-            macd_prev is not None and macd_sig_p is not None and
-            macd_line < macd_signal and macd_prev > macd_sig_p
-        )
+        # Bollinger
+        bb = tav.BollingerBands(close, window=BB_PERIOD, window_dev=BB_STD)
+        bb_upper, bb_mid, bb_lower = _safe(bb.bollinger_hband()), _safe(bb.bollinger_mavg()), _safe(bb.bollinger_lband())
+        bb_pct = _safe(bb.bollinger_pband())
+        bbw_series = bb.bollinger_wband()
+        bb_width = _safe(bbw_series)
+        bbw_pctile = _pctile_of_last(bbw_series)
 
-        # ── Bollinger Bands ───────────────────────────────────────────────────
-        bb_obj   = tav.BollingerBands(close, window=BB_PERIOD, window_dev=BB_STD)
-        bb_upper = _safe(bb_obj.bollinger_hband())
-        bb_mid   = _safe(bb_obj.bollinger_mavg())
-        bb_lower = _safe(bb_obj.bollinger_lband())
-        bb_pct   = _safe(bb_obj.bollinger_pband())
-        bb_wband = _safe(bb_obj.bollinger_wband())
-        bb_squeeze = (bb_wband < 0.05) if bb_wband is not None else False
+        # EMAs
+        ema9  = _safe(tat.EMAIndicator(close, window=EMA_FAST).ema_indicator())
+        ema21 = _safe(tat.EMAIndicator(close, window=EMA_MID).ema_indicator())
+        ema50 = _safe(tat.EMAIndicator(close, window=EMA_SLOW).ema_indicator())
+        ema200_series = tat.EMAIndicator(close, window=EMA_TREND).ema_indicator() if len(df) >= 200 else None
+        ema200 = _safe(ema200_series) if ema200_series is not None else None
+        ema200_prev = _safe(ema200_series, -5) if ema200_series is not None else None
+        ema200_slope = ((ema200 - ema200_prev) / ema200_prev * 100) if (ema200 and ema200_prev) else None
 
-        # ── EMAs ─────────────────────────────────────────────────────────────
-        ema9   = _safe(tat.EMAIndicator(close, window=EMA_FAST).ema_indicator())
-        ema21  = _safe(tat.EMAIndicator(close, window=EMA_MID).ema_indicator())
-        ema50  = _safe(tat.EMAIndicator(close, window=EMA_SLOW).ema_indicator())
-        ema200 = _safe(tat.EMAIndicator(close, window=EMA_TREND).ema_indicator()) if len(df) >= 200 else None
-
-        ema_bull = (ema9 is not None and ema21 is not None and ema50 is not None
-                    and ema9 > ema21 > ema50)
-        ema_bear = (ema9 is not None and ema21 is not None and ema50 is not None
-                    and ema9 < ema21 < ema50)
+        ema_bull = all(v is not None for v in (ema9, ema21, ema50)) and ema9 > ema21 > ema50
+        ema_bear = all(v is not None for v in (ema9, ema21, ema50)) and ema9 < ema21 < ema50
         above_200 = (price > ema200) if ema200 is not None else None
 
-        # ── ADX / DI ─────────────────────────────────────────────────────────
+        # ADX / DI
         adx_obj = tat.ADXIndicator(high, low, close, window=ADX_PERIOD)
-        adx     = _safe(adx_obj.adx())
-        di_pos  = _safe(adx_obj.adx_pos())
-        di_neg  = _safe(adx_obj.adx_neg())
-        trending  = (adx > 20) if adx is not None else False
-        adx_bull  = (adx is not None and di_pos is not None and di_neg is not None
-                     and adx > 20 and di_pos > di_neg)
-        adx_bear  = (adx is not None and di_pos is not None and di_neg is not None
-                     and adx > 20 and di_neg > di_pos)
+        adx, di_pos, di_neg = _safe(adx_obj.adx()), _safe(adx_obj.adx_pos()), _safe(adx_obj.adx_neg())
+        adx_bull = adx is not None and di_pos is not None and di_neg is not None and di_pos > di_neg
+        adx_bear = adx is not None and di_pos is not None and di_neg is not None and di_neg > di_pos
 
-        # ── ATR ──────────────────────────────────────────────────────────────
-        atr     = _safe(tav.AverageTrueRange(high, low, close, window=ATR_PERIOD).average_true_range())
+        # ATR
+        atr_series = tav.AverageTrueRange(high, low, close, window=ATR_PERIOD).average_true_range()
+        atr = _safe(atr_series)
         atr_pct = (atr / price * 100) if (atr and price) else None
+        atr_pctile = _pctile_of_last(atr_series / close)
 
-        # ── Stochastic ───────────────────────────────────────────────────────
-        stoch_obj = tam.StochasticOscillator(high, low, close, window=STOCH_K, smooth_window=STOCH_D)
-        stoch_k   = _safe(stoch_obj.stoch())
-        stoch_d   = _safe(stoch_obj.stoch_signal())
-        stoch_bull = (stoch_k is not None and stoch_d is not None
-                      and stoch_k > stoch_d and stoch_k < 30)
-        stoch_bear = (stoch_k is not None and stoch_d is not None
-                      and stoch_k < stoch_d and stoch_k > 70)
+        # Stochastic
+        st = tam.StochasticOscillator(high, low, close, window=STOCH_K, smooth_window=STOCH_D)
+        stoch_k, stoch_d = _safe(st.stoch()), _safe(st.stoch_signal())
 
-        # ── OBV ──────────────────────────────────────────────────────────────
+        # MFI / CMF / OBV
+        mfi = _safe(tavo.MFIIndicator(high, low, close, volume, window=MFI_PERIOD).money_flow_index())
+        cmf = _safe(tavo.ChaikinMoneyFlowIndicator(high, low, close, volume, window=CMF_PERIOD).chaikin_money_flow())
         obv_series = tavo.OnBalanceVolumeIndicator(close, volume).on_balance_volume()
-        obv        = _safe(obv_series)
-        obv_ma     = _safe(obv_series.rolling(OBV_MA_PERIOD).mean())
+        obv, obv_ma = _safe(obv_series), _safe(obv_series.rolling(OBV_MA_PERIOD).mean())
         obv_rising = (obv > obv_ma) if (obv is not None and obv_ma is not None) else None
 
-        # ── Volume analysis ───────────────────────────────────────────────────
-        vol_ma20    = float(volume.rolling(20).mean().iloc[-1])
+        # SuperTrend
+        st_dir_series, st_line_series = _supertrend(high, low, close)
+        st_dir = int(st_dir_series.iloc[-1])
+        st_line = _safe(st_line_series)
+        st_flip_bull = st_dir == 1 and int(st_dir_series.iloc[-2]) == -1
+        st_flip_bear = st_dir == -1 and int(st_dir_series.iloc[-2]) == 1
+
+        # Donchian
+        don_high = float(high.rolling(DONCHIAN_PERIOD).max().iloc[-2])  # exclude current bar
+        don_low  = float(low.rolling(DONCHIAN_PERIOD).min().iloc[-2])
+
+        # Volume
+        vol_ma20 = float(volume.rolling(20).mean().iloc[-1]) if len(volume) >= 20 else 0
         vol_current = float(volume.iloc[-1])
-        vol_ratio   = vol_current / vol_ma20 if vol_ma20 else 1.0
-        vol_spike   = vol_ratio > 1.5
+        vol_ratio = vol_current / vol_ma20 if vol_ma20 else 1.0
+        vol_spike = vol_ratio > 1.5
 
-        # ── Candle ───────────────────────────────────────────────────────────
-        prev_close   = float(close.iloc[-2])
-        body         = abs(price - float(open_.iloc[-1]))
-        candle_range = float(high.iloc[-1] - low.iloc[-1])
-        body_pct     = body / candle_range if candle_range else 0
+        # Candle patterns
+        patterns = _candle_patterns(df)
 
-        # ── RSI divergence ───────────────────────────────────────────────────
-        rsi_bull_div, rsi_bear_div = _detect_rsi_divergence(close, rsi_series)
-
-        # ── VWAP ─────────────────────────────────────────────────────────────
-        vwap = _compute_vwap(high, low, close, volume)
+        # Session VWAP
+        vwap = _session_vwap(df)
         above_vwap = (price > vwap) if vwap is not None else None
 
-        # ── Market regime ────────────────────────────────────────────────────
-        market_regime = _classify_regime(adx, bb_wband, ema_bull, ema_bear)
+        # Swing points / S-R / structure
+        lb = min(SR_LOOKBACK_CANDLES, len(df) - 5)
+        sh, sl_pts = _detect_swing_points(high.iloc[-lb:].reset_index(drop=True),
+                                          low.iloc[-lb:].reset_index(drop=True))
+        nearest_resistance, nearest_support = _nearest_sr(price, sh, sl_pts)
+        structure_bull, structure_bear = _price_structure(sh, sl_pts)
+        last_swing_low  = sl_pts[-1][1] if sl_pts else None
+        last_swing_high = sh[-1][1] if sh else None
 
-        # ── Support / Resistance ─────────────────────────────────────────────
-        sr_lookback = min(SR_LOOKBACK_CANDLES, len(df) - 5)
-        if sr_lookback >= 10:
-            sr_high = high.iloc[-sr_lookback:]
-            sr_low = low.iloc[-sr_lookback:]
-            swing_highs, swing_lows = _detect_swing_points(sr_high, sr_low)
-        else:
-            swing_highs, swing_lows = [], []
-
-        nearest_resistance, nearest_support = _find_nearest_sr(
-            price, swing_highs, swing_lows
-        )
-
-        # ── Price structure (higher highs / lower lows) ──────────────────────
-        structure_bull, structure_bear = _detect_price_structure(
-            swing_highs, swing_lows
-        )
+        # Pullback detection: did price touch EMA21 zone in the last 3 bars?
+        touched_ema21 = False
+        if ema21 is not None and atr:
+            recent_lows = low.iloc[-3:]
+            recent_highs = high.iloc[-3:]
+            touched_ema21 = bool(
+                (recent_lows.min() <= ema21 + 0.3 * atr and price > ema21) or
+                (recent_highs.max() >= ema21 - 0.3 * atr and price < ema21)
+            )
 
         return {
-            "price":          price,
-            "prev_close":     prev_close,
-            "change_pct":     (price - prev_close) / prev_close * 100,
+            "price": price,
+            "prev_close": float(close.iloc[-2]),
+            "change_pct": (price - float(close.iloc[-2])) / float(close.iloc[-2]) * 100,
 
-            "rsi":            rsi,
-            "rsi_bull_div":   rsi_bull_div,
-            "rsi_bear_div":   rsi_bear_div,
+            "rsi": rsi, "rsi_prev": rsi_prev,
+            "macd_line": macd_line, "macd_signal": macd_sig,
+            "macd_hist": macd_hist, "macd_hist_rising": macd_hist_rising,
+            "macd_cross_bull": macd_cross_bull, "macd_cross_bear": macd_cross_bear,
 
-            "macd_line":      macd_line,
-            "macd_signal":    macd_signal,
-            "macd_hist":      macd_hist,
-            "macd_cross_bull": macd_cross_bull,
-            "macd_cross_bear": macd_cross_bear,
+            "bb_upper": bb_upper, "bb_mid": bb_mid, "bb_lower": bb_lower,
+            "bb_pct": bb_pct, "bb_width": bb_width, "bbw_pctile": bbw_pctile,
 
-            "bb_upper":       bb_upper,
-            "bb_mid":         bb_mid,
-            "bb_lower":       bb_lower,
-            "bb_pct":         bb_pct,
-            "bb_width":       bb_wband,
-            "bb_squeeze":     bb_squeeze,
+            "ema9": ema9, "ema21": ema21, "ema50": ema50, "ema200": ema200,
+            "ema200_slope": ema200_slope,
+            "ema_bull": ema_bull, "ema_bear": ema_bear, "above_200": above_200,
+            "touched_ema21": touched_ema21,
 
-            "ema9":           ema9,
-            "ema21":          ema21,
-            "ema50":          ema50,
-            "ema200":         ema200,
-            "ema_bull":       ema_bull,
-            "ema_bear":       ema_bear,
-            "above_200":      above_200,
+            "adx": adx, "di_pos": di_pos, "di_neg": di_neg,
+            "adx_bull": adx_bull, "adx_bear": adx_bear,
 
-            "adx":            adx,
-            "di_pos":         di_pos,
-            "di_neg":         di_neg,
-            "trending":       trending,
-            "adx_bull":       adx_bull,
-            "adx_bear":       adx_bear,
+            "atr": atr, "atr_pct": atr_pct, "atr_pctile": atr_pctile,
 
-            "atr":            atr,
-            "atr_pct":        atr_pct,
+            "stoch_k": stoch_k, "stoch_d": stoch_d,
+            "mfi": mfi, "cmf": cmf,
+            "obv_rising": obv_rising,
 
-            "stoch_k":        stoch_k,
-            "stoch_d":        stoch_d,
-            "stoch_bull":     stoch_bull,
-            "stoch_bear":     stoch_bear,
+            "supertrend_dir": st_dir, "supertrend_line": st_line,
+            "st_flip_bull": st_flip_bull, "st_flip_bear": st_flip_bear,
 
-            "obv":            obv,
-            "obv_ma":         obv_ma,
-            "obv_rising":     obv_rising,
+            "donchian_high": don_high, "donchian_low": don_low,
 
-            "vol_ratio":      vol_ratio,
-            "vol_spike":      vol_spike,
-            "body_pct":       body_pct,
+            "vol_ratio": vol_ratio, "vol_spike": vol_spike,
 
-            # Phase 2 additions
-            "vwap":               vwap,
-            "above_vwap":         above_vwap,
-            "market_regime":      market_regime,
+            "vwap": vwap, "above_vwap": above_vwap,
+
             "nearest_resistance": nearest_resistance,
-            "nearest_support":    nearest_support,
-            "structure_bull":     structure_bull,
-            "structure_bear":     structure_bear,
+            "nearest_support": nearest_support,
+            "last_swing_low": last_swing_low,
+            "last_swing_high": last_swing_high,
+            "structure_bull": structure_bull, "structure_bear": structure_bear,
+
+            **patterns,
         }
 
     except Exception as e:

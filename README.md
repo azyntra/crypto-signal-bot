@@ -1,164 +1,105 @@
-# 🤖 Crypto Signal Bot
+# 🤖 Crypto Signal Bot v3
 
-Multi-exchange crypto signal generator for Binance, Bybit, OKX, and KuCoin.
-Scans top-100 coins by market cap, applies technical analysis, and pushes
-high-confidence trade signals to Telegram — both spot and futures markets.
-
----
-
-## Features
-
-- **Multi-exchange**: Binance, Bybit, OKX, KuCoin (spot + futures)
-- **Top-100 coins**: Auto-refreshed from CoinGecko every 30 minutes
-- **Two strategies**: Scalping (1m/5m/15m) + Swing trading (1h/4h/1d)
-- **Indicators**: RSI, MACD, EMA 9/21/50/200, Bollinger Bands, ADX, ATR, Stochastic, OBV
-- **Smart validation**: Minimum confidence 70%, minimum R:R 1:2, 3+ indicators must agree
-- **ATR-based SL/TP**: Dynamic stop loss + three take-profit targets
-- **Deduplication**: Won't resend the same signal within 30–240 min
-- **Rate limiting**: Max 10 signals/hour to keep channel clean
-- **Signal logging**: SQLite DB with win/loss tracking
-- **Telegram commands**: `/stats` `/status` `/start`
-- **systemd ready**: Auto-restart on crash, survives reboots
+Regime-gated crypto signal generator with honest, candle-accurate outcome
+tracking. Scans Binance futures pairs, publishes signals + chart images to
+Telegram, and reports performance in R-multiples (not vanity win rates).
 
 ---
 
-## Quick Start
+## What changed in v3 (full redesign)
 
-### 1. Clone and deploy on Oracle Ubuntu Server
+**Signal quality**
+- Dropped 1m/5m scalping (noise). Intraday = 15m entries, swing = 1h entries.
+- Hard-gated strategies instead of additive scoring:
+  - `trend_pullback` — buy pullbacks to EMA21 in an established 4h trend
+  - `range_fade` — fade BB extremes at S/R in quiet ranges only
+  - `squeeze_breakout` — volatility squeeze breaks with 1.8x+ volume
+- Choppy regime = **zero signals**. Ever.
+- BTC filter: alt longs blocked while BTC downtrends; shock circuit breaker
+  pauses everything on a ±1.5%/15m BTC move.
+- News guard: signals paused ±45 min around events in `data/events.json`.
+- Structure-based stops (behind swing points + ATR buffer), TP3 capped at
+  the next major level.
+
+**Honest tracking (this is why v2's "accuracy" was fake)**
+- Signals start PENDING; they only become trades if price actually trades
+  through the entry zone. Runaways close as NOFILL — not counted as wins.
+- Outcomes checked against 1m candle highs/lows — wicks count. If a candle
+  touches SL and TP, SL is counted first.
+- ALL results posted, wins and losses. Scaled exit model (⅓ per TP,
+  SL→BE after TP1) with realized R per trade, MFE/MAE recorded.
+
+**New features**
+- Chart image attached to every signal (entry zone, TPs, SL, EMAs)
+- `/backtest BTC intraday 30` — same engine as live, run on history
+- `/equity` — equity curve image; `/report` — expectancy, PF, max DD
+- `/ai SOL` — on-demand Gemini analysis; daily AI market brief at 08:05 UTC
+- `/regime`, `/events`, `/addevent` (admin)
+- Funding-rate crowding penalty, Fear & Greed bias, ML predictor
+  (auto-retrains weekly once 80+ closed trades exist)
+
+---
+
+## Quick start (Oracle Ubuntu)
 
 ```bash
-git clone <your-repo-url> crypto-signal-bot
 cd crypto-signal-bot
-bash scripts/deploy.sh
+git pull
+pip install -r requirements.txt
+python scripts/migrate_v3.py        # one-time DB migration from v2
+sudo systemctl restart crypto-signal-bot
 ```
 
-The deploy script stops after creating `.env` the first time — fill in your keys, then run it again.
+### .env
 
-### 2. Configure `.env`
+```
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHANNEL_ID=...
+TELEGRAM_ADMIN_ID=...
+GEMINI_API_KEY=...          # optional but recommended
+ML_PREDICTOR_ENABLED=false  # flip to true after 80+ closed trades
+```
+
+### Sanity checks before going live
 
 ```bash
-nano .env
+PYTHONPATH=. python scripts/debug_scan.py intraday   # dry run, no Telegram
+# then in Telegram:
+/backtest BTC intraday 30
+/backtest ETH swing 60
 ```
 
-Fill in:
-
-| Variable | Where to get it |
-|---|---|
-| `TELEGRAM_BOT_TOKEN` | Already set — `8303795974:AAH6T4s1wgKAEWoUXNzY1vAr_AIVSH-XFCc` |
-| `TELEGRAM_CHANNEL_ID` | Create a Telegram channel → Add bot as admin → Get ID via @userinfobot |
-| `TELEGRAM_ADMIN_ID` | Your personal Telegram user ID (via @userinfobot) |
-| `BINANCE_API_KEY/SECRET` | binance.com → API Management (read-only is enough for signals) |
-| `BYBIT_API_KEY/SECRET` | bybit.com → API (read-only) |
-| `OKX_API_KEY/SECRET/PASSPHRASE` | okx.com → API (read-only) |
-| `KUCOIN_API_KEY/SECRET/PASSPHRASE` | kucoin.com → API (read-only) |
-
-> **Note**: For Phase 1 (signals only), API keys are optional — public endpoints are used for OHLCV data.
-> Keys become required in Phase 2 for auto-execution.
-
-### 3. Start the bot
-
-```bash
-sudo systemctl start crypto-signal-bot
-sudo journalctl -u crypto-signal-bot -f
-```
+Run backtests on your main pairs first. If expectancy is negative on a
+pair, the bot has no edge there — that's the tool telling you the truth.
 
 ---
 
-## Telegram Channel Setup
+## Telegram commands
 
-1. Open Telegram → Create a new Channel
-2. Go to Channel Settings → Administrators → Add your bot as admin
-3. Send a message in the channel
-4. Visit: `https://api.telegram.org/bot<TOKEN>/getUpdates`
-5. Find `"chat":{"id":-100XXXXXXXXXX}` — that's your `TELEGRAM_CHANNEL_ID`
+`/stats` `/report [days]` `/open` `/best` `/equity` `/backtest SYM [style] [days]`
+`/ai SYM` `/regime` `/events` `/addevent YYYY-MM-DD HH:MM | name` `/status`
 
----
-
-## Signal Format Example
+## Architecture
 
 ```
-────────────────────────────────
-🚨 SIGNAL ALERT — LONG 🟢
-────────────────────────────────
-
-📊 BTC/USDT  ·  BYBIT  ·  FUTURES
-📈 SWING  |  ⏱ Timeframe: 4h
-
-🟢 ENTRY ZONE
-   $67,400 – $67,600
-
-🎯 TAKE PROFITS
-   TP1 → $68,500  (+1.6%)
-   TP2 → $69,800  (+3.5%)
-   TP3 → $71,200  (+5.6%)
-
-🛡 STOP LOSS
-   $66,100  (-2.0%)
-
-⚖️ Risk:Reward → 1 : 2.8
-💰 Leverage: 5–10x
-
-📊 CONFIDENCE: ████████░░ 82%
-
-🔍 SETUP
-   ✅ EMA 9>21>50 bull alignment
-   ✅ MACD bullish crossover
-   ✅ ADX trending bull (28)
-   ✅ OBV rising — accumulation
-   📌 RSI: 52.4  ·  ADX: 28  ·  Vol ×1.8
-
-🕐 Valid for: 4–48 hours
-
-#BTC #LONG #SWING #BYBIT #FUTURES
-────────────────────────────────
+main.py                     scheduler (15m intraday / 1h swing / 60s tracker)
+config/settings.py          all tuneables
+src/
+  data/fetcher.py           bulk tickers, cached OHLCV, funding, history
+  data/coin_universe.py     CoinGecko top coins + tradability filter
+  analysis/regime.py        coin regime, BTC filter, shock breaker, news guard
+  analysis/strategies.py    trend_pullback / range_fade / squeeze_breakout
+  analysis/indicators.py    RSI MACD BB EMA ADX ATR Stoch MFI CMF OBV
+                            SuperTrend Donchian VWAP patterns percentiles
+  analysis/ai_filter.py     Gemini review (async), daily brief, /ai
+  analysis/ml_predictor.py  XGBoost win-probability model
+  signals/validator.py      structural SL, R:R gate, entry zone
+  signals/charting.py       signal charts + equity curve (mplfinance)
+  tracking/outcome_tracker.py  1m-candle fill + exit engine
+  tracking/performance.py   expectancy, PF, drawdown, per-strategy stats
+  backtest/engine.py        historical simulation, /backtest
+  delivery/telegram_bot.py  channel delivery + commands
 ```
 
----
-
-## Configuration Tuning (`config/settings.py`)
-
-| Setting | Default | Description |
-|---|---|---|
-| `MIN_CONFIDENCE` | 70 | Minimum signal confidence % |
-| `MIN_RR_RATIO` | 2.0 | Minimum risk:reward ratio |
-| `MIN_INDICATORS_AGREE` | 3 | Minimum indicators that must agree |
-| `ATR_SL_MULTIPLIER` | 1.5 | Stop loss = ATR × this |
-| `TOP_N_COINS` | 100 | How many top coins to scan |
-| `MIN_VOLUME_USDT` | 1,000,000 | Minimum 24h volume filter |
-| `MAX_SIGNALS_PER_HOUR` | 10 | Rate limit per hour |
-| `SCALP_SCAN_INTERVAL_MIN` | 5 | Scalp scan every N minutes |
-| `SWING_SCAN_INTERVAL_MIN` | 60 | Swing scan every N minutes |
-
----
-
-## Phase 2: Auto-Execution (coming next)
-
-When you're ready to add auto-trading:
-- Add exchange API keys with trade permissions
-- Enable `AUTO_EXECUTE=true` in `.env`
-- The bot will place orders directly via ccxt, track positions, and close at TP/SL
-
----
-
-## Useful Commands
-
-```bash
-# Service management
-sudo systemctl start/stop/restart crypto-signal-bot
-sudo journalctl -u crypto-signal-bot -f
-
-# View logs
-tail -f logs/bot.log
-
-# Manual test run (no scheduler, runs one scan immediately)
-source venv/bin/activate
-python -c "import asyncio; from src.scanner import run_swing_scan; asyncio.run(run_swing_scan())"
-```
-
----
-
-## Disclaimer
-
-This bot is a technical analysis tool, not financial advice.
-Crypto markets are highly volatile. Always use proper risk management.
-Never trade more than you can afford to lose.
+⚠️ Signals are informational only — not financial advice. Never risk more
+than 1-2% of your account per trade.

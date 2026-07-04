@@ -1,186 +1,97 @@
 """
-formatter.py — Builds formatted Telegram messages for signals.
-Uses HTML formatting (supported by Telegram Bot API).
+formatter.py — Telegram message formatting (v3).
 """
-import html
-from datetime import datetime, timezone
-from config.logger import get_logger
-
-logger = get_logger(__name__)
-
-DIRECTION_EMOJI = {"LONG": "🟢", "SHORT": "🔴"}
-STYLE_EMOJI     = {"scalp": "⚡", "swing": "📈"}
-MARKET_EMOJI    = {"spot": "💱", "futures": "⚙️"}
+from typing import Optional
 
 
-def _e(value) -> str:
-    """Escape any dynamic value for safe insertion into Telegram HTML."""
-    return html.escape(str(value))
+def _fmt(v: Optional[float]) -> str:
+    if v is None: return "N/A"
+    if v >= 1000: return f"{v:,.2f}"
+    if v >= 1:    return f"{v:.4f}"
+    if v >= 0.01: return f"{v:.5f}"
+    return f"{v:.8f}"
 
 
-def format_signal(
-    signal: dict,
-    symbol: str,
-    exchange: str,
-    style: str,          # 'scalp' or 'swing'
-    timeframe: str,
-    market_type: str,    # 'spot' or 'futures'
-) -> str:
-    """
-    Render a complete signal as a Telegram HTML message string.
-    All dynamic values are html.escape()'d to prevent parse errors.
-    """
-    d       = signal["direction"]
-    conf    = signal["confidence"]
-    reasons = signal["reasons"]
-    price   = signal["price"]
+STRATEGY_LABELS = {
+    "trend_pullback":   "📈 Trend Pullback",
+    "range_fade":       "🔁 Range Reversal",
+    "squeeze_breakout": "💥 Squeeze Breakout",
+}
 
-    # ── Header ────────────────────────────────────────────────────────────────
-    dir_emoji   = DIRECTION_EMOJI.get(d, "⚪")
-    style_label = "SCALP" if style == "scalp" else "SWING"
-    market_label = market_type.upper()
+REGIME_LABELS = {
+    "trend_up": "Uptrend", "trend_down": "Downtrend",
+    "range": "Range", "choppy": "Choppy",
+}
+
+
+def format_signal(signal: dict, symbol: str, exchange: str, style: str,
+                  timeframe: str, market_type: str, regime: str = None) -> str:
+    d = signal["direction"]
+    dir_emoji = "🟢" if d == "LONG" else "🔴"
+    style_emoji = "⚡" if style == "intraday" else "📈"
+    strat = STRATEGY_LABELS.get(signal.get("strategy"), signal.get("strategy", ""))
+
+    conf = signal["confidence"]
+    conf_bar = "█" * round(conf / 100 * 8) + "░" * (8 - round(conf / 100 * 8))
 
     lines = [
-        f"{'─' * 32}",
-        f"🚨 <b>SIGNAL ALERT — {_e(d)}</b> {dir_emoji}",
-        f"{'─' * 32}",
+        "─" * 30,
+        f"{dir_emoji} <b>{d} — {symbol}</b>",
+        "─" * 30,
+        f"{style_emoji} {style.upper()} · {timeframe} · {exchange.upper()} {market_type.upper()}",
+        f"{strat}" + (f"  ·  Regime: {REGIME_LABELS.get(regime, regime)}" if regime else ""),
         "",
-        f"📊 <b>{_e(symbol)}</b>  ·  {_e(exchange.upper())}  ·  {_e(market_label)}",
-        f"{STYLE_EMOJI[style]} <b>{_e(style_label)}</b>  |  ⏱ Timeframe: <b>{_e(timeframe)}</b>",
+        f"🎯 Confidence: {conf_bar} <b>{conf}%</b>",
         "",
+        f"📍 Entry zone: <b>${_fmt(signal['entry_low'])} – ${_fmt(signal['entry_high'])}</b>",
+        "   (wait for price to enter the zone — do not chase)",
+        "",
+        f"🎯 TP1: ${_fmt(signal['tp1'])}  (+{signal['tp1_pct']}%)",
+        f"🎯 TP2: ${_fmt(signal['tp2'])}  (+{signal['tp2_pct']}%)",
+        f"🎯 TP3: ${_fmt(signal['tp3'])}  (+{signal['tp3_pct']}%)",
+        f"🛡 SL:  ${_fmt(signal['stop_loss'])}  (-{signal['risk_pct']}%)",
+        f"⚖️ R:R at TP2: <b>{signal['rr_ratio']}</b>",
+        "",
+        "💡 Plan: close ⅓ at each TP · SL → breakeven after TP1",
     ]
+    if signal.get("risk_note"):
+        lines.append(f"📐 {signal['risk_note']}")
 
-    # ── Entry zone ────────────────────────────────────────────────────────────
+    reasons = signal.get("reasons", [])
+    if reasons:
+        lines += ["", "<b>Why:</b>"] + [f" • {r}" for r in reasons[:6]]
+
+    if signal.get("ai_reasoning"):
+        lines += ["", f"🤖 AI: <i>{signal['ai_reasoning']}</i>"]
+
+    sent = signal.get("sentiment")
+    if sent:
+        lines.append(f"😨 Fear & Greed: {sent.get('value')} ({sent.get('label')})")
+    if signal.get("funding_rate") is not None:
+        lines.append(f"💸 Funding: {signal['funding_rate']*100:+.4f}%")
+
     lines += [
-        f"{'🟢' if d == 'LONG' else '🔴'} <b>ENTRY ZONE</b>",
-        f"   ${_e(_fmt(signal['entry_low']))} – ${_e(_fmt(signal['entry_high']))}",
-        "",
+        "─" * 30,
+        f"#{symbol.replace('/', '')} #{d} #{style.upper()} #{(signal.get('strategy') or '').upper()}",
+        "⚠️ <i>Not financial advice. Risk max 1-2% per trade.</i>",
     ]
-
-    # ── Take profits ──────────────────────────────────────────────────────────
-    tp_sign = "+" if d == "LONG" else "-"
-    lines += [
-        f"🎯 <b>TAKE PROFITS</b>",
-        f"   TP1 → <b>${_e(_fmt(signal['tp1']))}</b>  ({_e(tp_sign)}{_e(signal['tp1_pct'])}%)",
-        f"   TP2 → <b>${_e(_fmt(signal['tp2']))}</b>  ({_e(tp_sign)}{_e(signal['tp2_pct'])}%)",
-        f"   TP3 → <b>${_e(_fmt(signal['tp3']))}</b>  ({_e(tp_sign)}{_e(signal['tp3_pct'])}%)",
-        "",
-    ]
-
-    # ── Stop loss ─────────────────────────────────────────────────────────────
-    sl_sign = "-" if d == "LONG" else "+"
-    lines += [
-        f"🛡 <b>STOP LOSS</b>",
-        f"   ${_e(_fmt(signal['stop_loss']))}  ({_e(sl_sign)}{_e(signal['risk_pct'])}%)",
-        "",
-    ]
-
-    # ── R:R + Leverage ────────────────────────────────────────────────────────
-    lines += [
-        f"⚖️ <b>Risk:Reward</b> → 1 : {_e(signal['rr_ratio'])}",
-        f"💰 <b>Leverage</b>: {_e(signal['leverage'])}",
-        "",
-    ]
-
-    # ── Confidence bar ────────────────────────────────────────────────────────
-    bar = _confidence_bar(conf)
-    lines += [
-        f"📊 <b>CONFIDENCE</b>: {bar} {_e(conf)}%",
-    ]
-    if "ai_reasoning" in signal and signal["ai_reasoning"]:
-        lines.append(f"🤖 <b>AI View</b>: {_e(signal['ai_reasoning'])}")
-    if "ml_win_prob" in signal and signal["ml_win_prob"]:
-        lines.append(f"🧠 <b>ML Win Prob</b>: {_e(round(signal['ml_win_prob']*100))}%")
-    if "sentiment" in signal and signal["sentiment"]:
-        lines.append(f"🌐 <b>Sentiment</b>: {_e(signal['sentiment']['label'])}")
-    lines.append("")
-
-    # ── Setup reasons ─────────────────────────────────────────────────────────
-    lines.append(f"🔍 <b>SETUP</b>")
-    for r in reasons:
-        lines.append(f"   ✅ {_e(r)}")
-
-    # Indicator callouts
-    extra = []
-    if signal.get("rsi"):
-        rsi_str = f"{signal['rsi']:.1f}"
-        extra.append(f"RSI: {_e(rsi_str)}")
-    if signal.get("adx"):
-        adx_str = f"{signal['adx']:.0f}"
-        extra.append(f"ADX: {_e(adx_str)}")
-    if signal.get("vol_ratio"):
-        vol_str = f"{signal['vol_ratio']:.1f}"
-        extra.append(f"Vol ×{_e(vol_str)}")
-    if signal.get("above_200") is True:
-        extra.append("Above EMA200 ✅")
-    elif signal.get("above_200") is False:
-        extra.append("Below EMA200 ⚠️")
-    if extra:
-        lines.append(f"   📌 " + "  ·  ".join(extra))
-
-    # ── Validity window ───────────────────────────────────────────────────────
-    validity = "15–60 min" if style == "scalp" else "4–48 hours"
-    lines += [
-        "",
-        f"🕐 <b>Valid for</b>: {validity}",
-    ]
-
-    # ── Hashtags ──────────────────────────────────────────────────────────────
-    base = symbol.split("/")[0]
-    tags = f"#{_e(base)} #{_e(d)} #{_e(style_label)} #{_e(exchange.upper())}"
-    if market_type == "futures":
-        tags += " #FUTURES"
-    else:
-        tags += " #SPOT"
-    lines += ["", tags, "─" * 32]
-
     return "\n".join(lines)
 
 
-def format_summary_report(signals_sent: int, scanned: int, exchange: str) -> str:
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def format_startup_message(version: str) -> str:
     return (
-        f"📋 <b>Scan Report</b> — {_e(now)}\n"
-        f"Exchange: {_e(exchange.upper())}\n"
-        f"Pairs scanned: {_e(scanned)}\n"
-        f"Signals sent: {_e(signals_sent)}\n"
-    )
-
-
-def format_startup_message(version: str = "1.0.0") -> str:
-    return (
-        f"🤖 <b>Crypto Signal Bot v{_e(version)} started</b>\n\n"
-        f"✅ Multi-exchange scanner active\n"
-        f"✅ Top-100 coins by market cap\n"
-        f"✅ Scalping (1m/5m/15m) + Swing (1h/4h/1d)\n"
-        f"✅ Spot + Futures markets\n\n"
-        f"Signals will appear here automatically.\n"
-        f"<i>Do your own research. This is not financial advice.</i>"
+        "─" * 30 + "\n"
+        f"🤖 <b>Crypto Signal Bot v{version} online</b>\n"
+        + "─" * 30 + "\n\n"
+        "⚡ Intraday scanner: 15m entries (every 15 min)\n"
+        "📈 Swing scanner: 1h entries (every 60 min)\n"
+        "🧭 Regime-gated strategies + BTC filter\n"
+        "🔍 Candle-accurate outcome tracking\n"
+        "📊 All results posted — wins AND losses\n"
     )
 
 
 def format_error_alert(context: str, error: str) -> str:
-    return (
-        f"⚠️ <b>Bot Error</b>\n"
-        f"Context: {_e(context)}\n"
-        f"Error: <code>{_e(error[:200])}</code>"
-    )
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _fmt(value: float) -> str:
-    """Format a price with appropriate precision."""
-    if value >= 1000:
-        return f"{value:,.2f}"
-    elif value >= 1:
-        return f"{value:.4f}"
-    elif value >= 0.01:
-        return f"{value:.5f}"
-    else:
-        return f"{value:.8f}"
-
-
-def _confidence_bar(conf: int, width: int = 10) -> str:
-    filled = round(conf / 100 * width)
-    return "█" * filled + "░" * (width - filled)
+    return (f"🚨 <b>Bot error</b>\n\n"
+            f"Context: {context}\n"
+            f"<code>{error[:500]}</code>")

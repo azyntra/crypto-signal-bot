@@ -1,56 +1,69 @@
-import asyncio
-import json
-from src.data.fetcher import fetch_multi_timeframe
-from src.data.coin_universe import fetch_top_coins, build_pairs
-from src.data.fetcher import get_exchange_symbols
-from src.analysis.indicators import compute_indicators
-from src.analysis.scalping import score_scalp
-from src.signals.validator import validate_and_build
-from config.settings import SCALPING_TIMEFRAMES
+"""
+debug_scan.py — Dry-run one scan pass without sending Telegram messages.
 
-async def test():
-    exchange = "binance"
-    market_type = "futures"
-    
+Usage:
+    PYTHONPATH=. python scripts/debug_scan.py [intraday|swing]
+
+Prints regime + best strategy candidate per symbol so you can see WHY
+signals are (not) firing.
+"""
+import asyncio
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from src.data.fetcher import fetch_multi_timeframe, get_exchange_symbols, fetch_bulk_volumes, close_all
+from src.data.coin_universe import fetch_top_coins, build_pairs
+from src.analysis.indicators import compute_indicators
+from src.analysis.strategies import evaluate
+from src.analysis.regime import classify_regime, get_btc_regime
+from src.signals.validator import validate_and_build
+from config.settings import (
+    INTRADAY_TIMEFRAMES, SWING_TIMEFRAMES, MARKET_TYPE,
+    SCAN_EXCHANGES, MIN_VOLUME_USDT,
+)
+
+
+async def test(style: str = "intraday"):
+    exchange = SCAN_EXCHANGES[0]
+    tfs = INTRADAY_TIMEFRAMES if style == "intraday" else SWING_TIMEFRAMES
+
+    btc = await get_btc_regime()
+    print(f"BTC regime: {btc.get('regime')}  shock: {btc.get('shock')}\n")
+
     top_coins = fetch_top_coins()
-    ex_symbols = await get_exchange_symbols(exchange, market_type)
-    pairs = build_pairs(ex_symbols, top_coins)
-    
-    print(f"Scanning {len(pairs)} pairs on {exchange}/{market_type}...\n")
-    
-    max_score = 0
-    best_pair = None
-    
-    for symbol in pairs:
+    ex_symbols = await get_exchange_symbols(exchange, MARKET_TYPE)
+    volumes = await fetch_bulk_volumes(exchange, MARKET_TYPE)
+    pairs = [p for p in build_pairs(ex_symbols, top_coins)
+             if volumes.get(p, 0) >= MIN_VOLUME_USDT]
+    print(f"Scanning {len(pairs)} pairs on {exchange}/{MARKET_TYPE} ({style})...\n")
+
+    candidates = 0
+    for symbol in pairs[:40]:
         try:
-            data = await fetch_multi_timeframe(exchange, symbol, SCALPING_TIMEFRAMES, market_type)
-            if "5m" not in data or "15m" not in data: continue
-            
-            ind_5m = compute_indicators(data.get("5m"))
-            ind_15m = compute_indicators(data.get("15m"))
-            if not ind_5m: continue
-                
-            res = score_scalp(ind_5m, ind_15m)
-            long_s = res.get("long_score", 0)
-            short_s = res.get("short_score", 0)
-            score = max(long_s, short_s)
-            
-            if score > max_score:
-                max_score = score
-                best_pair = symbol
-                
-            if score >= 40:
-                print(f"[{symbol}] {res.get('direction', 'NONE')} Score: {score}")
-                print(f"  Regime: {ind_5m.get('market_regime')}")
-                print(f"  Reasons: {res.get('reasons')}")
-                print(f"  RSI: {ind_5m.get('rsi'):.1f}")
-                print("-" * 40)
-                
-            await asyncio.sleep(0.2)
+            data = await fetch_multi_timeframe(exchange, symbol, tfs, MARKET_TYPE)
+            if tfs[0] not in data:
+                continue
+            ind_entry = compute_indicators(data[tfs[0]])
+            ind_htf = compute_indicators(data.get(tfs[1]))
+            ind_regime = compute_indicators(data.get(tfs[2])) if len(tfs) > 2 else ind_htf
+            if not ind_entry or not ind_regime:
+                continue
+            regime = classify_regime(ind_regime, ind_htf)
+            cand = evaluate(ind_entry, ind_htf, regime)
+            line = f"{symbol:<16} regime={regime:<11}"
+            if cand:
+                sig = validate_and_build(cand, style)
+                ok = "✅ SIGNAL" if sig else "⚠ failed validation"
+                line += f" {cand['direction']} {cand['strategy']} conf={cand['confidence']} {ok}"
+                candidates += 1
+            print(line)
         except Exception as e:
-            print(f"Error {symbol}: {e}")
-            
-    print(f"\nHighest score seen: {max_score} on {best_pair}")
+            print(f"{symbol:<16} error: {e}")
+
+    print(f"\n{candidates} candidates found.")
+    await close_all()
+
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    style = sys.argv[1] if len(sys.argv) > 1 else "intraday"
+    asyncio.run(test(style))

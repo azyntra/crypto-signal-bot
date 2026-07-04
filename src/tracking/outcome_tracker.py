@@ -1,203 +1,115 @@
 """
-outcome_tracker.py — Monitors all open signals and automatically records
-whether TP1 / TP2 / TP3 / SL was hit.
+outcome_tracker.py — Candle-based trade lifecycle tracking (v3).
 
-v2.0 — Trailing stop management:
-  - When price reaches 50% of TP1 → move SL to break-even
-  - When TP1 hit → move SL to 50% between entry and TP1, send notification
-  - When TP2 hit → move SL to TP1, send notification
-  - When TP3 hit → close fully
-  - SL check uses adjusted_sl if set, otherwise original stop_loss
+Why this is a full rewrite:
+  v2 polled the *last ticker price* every 60s, so any TP/SL touched by a
+  wick between polls was silently missed, and every signal was assumed to
+  be filled instantly at scan price. v2 also never posted SL results, so
+  the channel history looked like the bot never lost.
 
-Also includes:
-  - Backlog guard for stale signals
-  - Result rate limiting
-  - Batch expiry of old signals
+v3:
+  - PENDING → ACTIVE: a trade only becomes active if a 1m candle actually
+    trades through the entry zone. If price runs to TP without filling,
+    the signal closes as NOFILL (no win claimed, no loss booked).
+  - Level detection walks 1m candle highs/lows since the last check —
+    wicks count. If a candle touches both SL and TP, SL is assumed first
+    (pessimistic, honest).
+  - Scaled exit model for R accounting: 1/3 closed at TP1 (SL→breakeven),
+    1/3 at TP2 (SL→TP1), 1/3 rides to TP3 or the trailed stop.
+  - ALL outcomes are posted to the channel — wins AND losses.
+  - MFE/MAE recorded for every trade (feeds the ML model and honest stats).
 """
 import asyncio
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+import pandas as pd
+
 from src.database.db_logger import SessionLocal, SignalRecord
-from src.data.fetcher import fetch_ticker_price
+from src.data.fetcher import fetch_ohlcv, fetch_ticker_price
 from src.delivery.telegram_bot import send_result
-from config.settings import TRAILING_STOP_ENABLED, BREAKEVEN_TRIGGER
+from config.settings import (
+    FILL_EXPIRY_HOURS, TRADE_EXPIRY_HOURS, TP1_R, TP2_R, TP3_R, TP_PORTIONS,
+)
 from config.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Max signal lifetime before silent expiry
-EXPIRY_HOURS = {
-    "scalp": 2,
-    "swing": 72,
-}
-
-# Max result notifications per hour (separate from signal rate limit)
-MAX_RESULTS_PER_HOUR = 10
+MAX_RESULTS_PER_HOUR = 30
 _results_this_hour: list = []
 
 
-# ── Price fetching ─────────────────────────────────────────────────────────────
+# ── Candle data ───────────────────────────────────────────────────────────────
 
-async def _get_current_price(exchange_name: str, symbol: str, market_type: str) -> Optional[float]:
-    return await fetch_ticker_price(exchange_name, symbol, market_type)
+async def _get_candles_since(rec: SignalRecord, since: datetime) -> Optional[pd.DataFrame]:
+    """1m candles since `since` (falls back to 5m for long gaps)."""
+    age_min = (datetime.now(timezone.utc) - since).total_seconds() / 60
+    tf, limit = ("1m", min(int(age_min) + 3, 900)) if age_min <= 850 else ("5m", min(int(age_min / 5) + 3, 900))
+    df = await fetch_ohlcv(rec.exchange, rec.symbol, tf, rec.market_type,
+                           limit=max(limit, 5), use_cache=False)
+    if df is None:
+        return None
+    return df[df.index >= since]
 
 
-# ── Trailing stop logic ──────────────────────────────────────────────────────
+def _aware(dt: Optional[datetime]) -> Optional[datetime]:
+    if dt is None:
+        return None
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt
 
-def _get_effective_sl(rec: SignalRecord) -> float:
-    """Return the adjusted SL if set, otherwise the original."""
-    return rec.adjusted_sl if rec.adjusted_sl is not None else rec.stop_loss
 
+# ── R / P&L accounting (scaled exit model) ────────────────────────────────────
 
-def _check_trailing_and_levels(price: float, rec: SignalRecord) -> Optional[str]:
+def _realized(rec: SignalRecord, final_exit: float) -> tuple[float, float]:
     """
-    Check TP/SL levels with trailing stop management.
-
-    Returns:
-      - "TP3" / "TP2" / "TP1" / "SL" if a level is definitively hit
-      - "TRAIL_BE" / "TRAIL_TP1" / "TRAIL_TP2" if trailing stop should be moved
-      - None if no level hit
+    Returns (r_multiple, profit_pct) under the scaled exit model,
+    given the final exit price of the remaining position.
     """
-    d = rec.direction
-    entry = rec.price_at_signal
-    effective_sl = _get_effective_sl(rec)
+    entry = rec.fill_price or rec.price_at_signal
+    risk = abs(entry - rec.stop_loss)
+    if not entry or not risk:
+        return 0.0, 0.0
+    sign = 1 if rec.direction == "LONG" else -1
+    p1, p2, p3 = TP_PORTIONS
 
-    if d == "LONG":
-        # Check definitive closes first
-        if rec.tp3 and price >= rec.tp3:
-            return "TP3"
-        if effective_sl and price <= effective_sl:
-            return "SL"
+    exits = []
+    if rec.highest_tp_hit in ("TP1", "TP2", "TP3"):
+        exits.append((p1, rec.tp1))
+    if rec.highest_tp_hit in ("TP2", "TP3"):
+        exits.append((p2, rec.tp2))
+    if rec.highest_tp_hit == "TP3":
+        exits.append((p3, rec.tp3))
+    # remaining portion exits at final_exit
+    used = sum(p for p, _ in exits)
+    if used < 0.999:
+        exits.append((1 - used, final_exit))
 
-        # Check trailing stop moves (only if enabled)
-        if TRAILING_STOP_ENABLED and entry:
-            # TP2 hit → trail SL to TP1
-            if rec.tp2 and price >= rec.tp2 and rec.highest_tp_hit != "TP2":
-                return "TRAIL_TP2"
-            # TP1 hit → trail SL to midpoint(entry, TP1)
-            if rec.tp1 and price >= rec.tp1 and rec.highest_tp_hit not in ("TP1", "TP2"):
-                return "TRAIL_TP1"
-            # Break-even trigger → move SL to entry
-            if rec.tp1 and rec.highest_tp_hit is None:
-                be_price = entry + (rec.tp1 - entry) * BREAKEVEN_TRIGGER
-                if price >= be_price and rec.adjusted_sl is None:
-                    return "TRAIL_BE"
-
-    elif d == "SHORT":
-        if rec.tp3 and price <= rec.tp3:
-            return "TP3"
-        if effective_sl and price >= effective_sl:
-            return "SL"
-
-        if TRAILING_STOP_ENABLED and entry:
-            if rec.tp2 and price <= rec.tp2 and rec.highest_tp_hit != "TP2":
-                return "TRAIL_TP2"
-            if rec.tp1 and price <= rec.tp1 and rec.highest_tp_hit not in ("TP1", "TP2"):
-                return "TRAIL_TP1"
-            if rec.tp1 and rec.highest_tp_hit is None:
-                be_price = entry - (entry - rec.tp1) * BREAKEVEN_TRIGGER
-                if price <= be_price and rec.adjusted_sl is None:
-                    return "TRAIL_BE"
-
-    return None
+    r_total = sum(p * (sign * (px - entry) / risk) for p, px in exits if px)
+    pnl_total = sum(p * (sign * (px - entry) / entry * 100) for p, px in exits if px)
+    return round(r_total, 3), round(pnl_total, 3)
 
 
-def _apply_trailing_move(signal_id: int, trail_type: str, rec: SignalRecord):
-    """Update the adjusted SL and highest_tp_hit in the database."""
-    entry = rec.price_at_signal
-    d = rec.direction
+# ── DB helpers ────────────────────────────────────────────────────────────────
 
+def _update(rec_id: int, **kwargs):
     with SessionLocal() as db:
-        record = db.get(SignalRecord, signal_id)
-        if not record:
-            return
-
-        if trail_type == "TRAIL_BE":
-            # Move SL to break-even (entry price)
-            record.adjusted_sl = entry
-            logger.info(f"Signal #{signal_id}: SL moved to break-even ${entry}")
-
-        elif trail_type == "TRAIL_TP1":
-            # TP1 hit → move SL to midpoint between entry and TP1
-            record.highest_tp_hit = "TP1"
-            if d == "LONG":
-                new_sl = entry + (rec.tp1 - entry) * 0.5
-            else:
-                new_sl = entry - (entry - rec.tp1) * 0.5
-            record.adjusted_sl = round(new_sl, 8)
-            record.partial_profit_pct = round(
-                abs(rec.tp1 - entry) / entry * 100, 2
-            )
-            logger.info(f"Signal #{signal_id}: TP1 hit! SL trailed to ${new_sl:.6f}")
-
-        elif trail_type == "TRAIL_TP2":
-            # TP2 hit → move SL to TP1
-            record.highest_tp_hit = "TP2"
-            record.adjusted_sl = rec.tp1
-            record.partial_profit_pct = round(
-                abs(rec.tp2 - entry) / entry * 100, 2
-            )
-            logger.info(f"Signal #{signal_id}: TP2 hit! SL trailed to TP1 ${rec.tp1}")
-
-        db.commit()
-
-
-# ── Profit calculation ────────────────────────────────────────────────────────
-
-def _calc_profit(outcome: str, rec: SignalRecord) -> float:
-    entry = rec.price_at_signal
-    if not entry or entry == 0:
-        return 0.0
-
-    # For SL with trailing stop: use adjusted SL for actual exit price
-    if outcome == "SL" and rec.adjusted_sl is not None:
-        target = rec.adjusted_sl
-    else:
-        target_map = {"TP1": rec.tp1, "TP2": rec.tp2, "TP3": rec.tp3, "SL": rec.stop_loss}
-        target = target_map.get(outcome)
-
-    if not target:
-        return 0.0
-    if rec.direction == "LONG":
-        return round((target - entry) / entry * 100, 3)
-    else:
-        return round((entry - target) / entry * 100, 3)
-
-
-# ── DB helpers ─────────────────────────────────────────────────────────────────
-
-def _close_signal_in_db(signal_id: int, outcome: str, price: float, profit_pct: float):
-    with SessionLocal() as db:
-        rec = db.get(SignalRecord, signal_id)
-        if rec:
-            rec.outcome        = outcome
-            rec.price_at_close = price
-            rec.profit_pct     = profit_pct
-            rec.closed_at      = datetime.now(timezone.utc)
+        r = db.get(SignalRecord, rec_id)
+        if r:
+            for k, v in kwargs.items():
+                setattr(r, k, v)
             db.commit()
-    logger.info(f"Signal #{signal_id} → {outcome}  {profit_pct:+.2f}%")
 
 
-def _bulk_expire_old_signals(signal_ids: list[int]):
-    if not signal_ids:
-        return
-    with SessionLocal() as db:
-        db.query(SignalRecord).filter(
-            SignalRecord.id.in_(signal_ids)
-        ).update(
-            {
-                "outcome":    "EXPIRED",
-                "profit_pct": 0.0,
-                "closed_at":  datetime.now(timezone.utc),
-            },
-            synchronize_session=False,
-        )
-        db.commit()
-    logger.info(f"Bulk-expired {len(signal_ids)} stale signals.")
+def _close(rec: SignalRecord, outcome: str, exit_price: float):
+    r_mult, pnl = _realized(rec, exit_price)
+    _update(rec.id, outcome=outcome, status="CLOSED", price_at_close=exit_price,
+            profit_pct=pnl, r_multiple=r_mult,
+            closed_at=datetime.now(timezone.utc))
+    logger.info(f"Signal #{rec.id} {rec.symbol} → {outcome}  R={r_mult:+.2f}  {pnl:+.2f}%")
+    return r_mult, pnl
 
 
-def _get_open_signals() -> list[SignalRecord]:
+def _get_open() -> list[SignalRecord]:
     with SessionLocal() as db:
         recs = db.query(SignalRecord).filter(
             SignalRecord.outcome.is_(None),
@@ -207,213 +119,205 @@ def _get_open_signals() -> list[SignalRecord]:
         return recs
 
 
-def _is_within_notify_window(rec: SignalRecord) -> bool:
-    created = rec.created_at
-    if not created:
-        return False
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    expiry_h = EXPIRY_HOURS.get(rec.style, 4)
-    age = datetime.now(timezone.utc) - created
-    return age <= timedelta(hours=expiry_h)
+# ── Level walking ─────────────────────────────────────────────────────────────
+
+def _walk_pending(rec: SignalRecord, candles: pd.DataFrame):
+    """
+    Walk candles for a PENDING signal.
+    Returns (filled_index, fill_price) or ("NOFILL_TP", None) if price ran
+    to TP1 without ever filling, or (None, None) if still pending.
+    """
+    lo, hi = rec.entry_low, rec.entry_high
+    for i, (ts, c) in enumerate(candles.iterrows()):
+        overlaps = c["low"] <= hi and c["high"] >= lo
+        if overlaps:
+            # fill at zone boundary or open, whichever is inside the zone
+            fill = min(max(c["open"], lo), hi)
+            return i, float(fill)
+        if rec.direction == "LONG" and rec.tp1 and c["high"] >= rec.tp1:
+            return "NOFILL_TP", None
+        if rec.direction == "SHORT" and rec.tp1 and c["low"] <= rec.tp1:
+            return "NOFILL_TP", None
+    return None, None
 
 
-# ── Result rate limiter ────────────────────────────────────────────────────────
+def _walk_active(rec: SignalRecord, candles: pd.DataFrame, state: dict):
+    """
+    Walk candles for an ACTIVE trade. Mutates `state`:
+      highest_tp_hit, adjusted_sl, mfe, mae
+    Returns (outcome, exit_price) or (None, None).
+    Pessimistic rule: SL checked before TP within each candle.
+    """
+    sign = 1 if rec.direction == "LONG" else -1
+    entry = state["fill_price"]
 
-async def _send_result_guarded(text: str):
+    for ts, c in candles.iterrows():
+        hi_ex = sign * (c["high"] if sign == 1 else c["low"]) - sign * entry   # favorable
+        lo_ex = sign * entry - sign * (c["low"] if sign == 1 else c["high"])   # adverse
+        state["mfe"] = max(state["mfe"], hi_ex / entry * 100)
+        state["mae"] = max(state["mae"], lo_ex / entry * 100)
+
+        eff_sl = state["adjusted_sl"] if state["adjusted_sl"] is not None else rec.stop_loss
+
+        sl_touched = (c["low"] <= eff_sl) if sign == 1 else (c["high"] >= eff_sl)
+        if sl_touched:
+            if state["highest_tp_hit"] is None:
+                return "SL", float(eff_sl)
+            # stopped after partials — outcome is the highest TP reached
+            return state["highest_tp_hit"], float(eff_sl)
+
+        def hit(level):
+            return level and ((c["high"] >= level) if sign == 1 else (c["low"] <= level))
+
+        if hit(rec.tp3):
+            state["highest_tp_hit"] = "TP3"
+            return "TP3", float(rec.tp3)
+        if hit(rec.tp2) and state["highest_tp_hit"] != "TP2":
+            state["highest_tp_hit"] = "TP2"
+            state["adjusted_sl"] = rec.tp1
+        elif hit(rec.tp1) and state["highest_tp_hit"] is None:
+            state["highest_tp_hit"] = "TP1"
+            state["adjusted_sl"] = entry   # breakeven
+
+    return None, None
+
+
+# ── Result posting (ALL results — wins and losses) ────────────────────────────
+
+def _fmt(v: Optional[float]) -> str:
+    if v is None: return "N/A"
+    if v >= 1000: return f"{v:,.2f}"
+    if v >= 1:    return f"{v:.4f}"
+    if v >= 0.01: return f"{v:.5f}"
+    return f"{v:.8f}"
+
+
+def _elapsed(rec: SignalRecord) -> str:
+    start = _aware(rec.filled_at or rec.created_at)
+    if not start: return "?"
+    m = int((datetime.now(timezone.utc) - start).total_seconds() / 60)
+    return f"{m}m" if m < 60 else f"{m//60}h {m%60}m"
+
+
+def _result_msg(rec: SignalRecord, outcome: str, exit_price: float,
+                r_mult: float, pnl: float) -> str:
+    emoji = {"TP3": "🏆", "TP2": "✅", "TP1": "✅", "SL": "❌",
+             "NOFILL": "⚪", "EXPIRED": "⏰"}.get(outcome, "⚪")
+    label = {"TP3": "FULL TARGET HIT", "TP2": "TP2 + TRAILED OUT",
+             "TP1": "TP1 + TRAILED OUT", "SL": "STOPPED OUT",
+             "NOFILL": "ENTRY NOT FILLED", "EXPIRED": "EXPIRED"}.get(outcome, outcome)
+    dir_e = "🟢" if rec.direction == "LONG" else "🔴"
+    sign = "+" if r_mult >= 0 else ""
+
+    lines = [
+        "─" * 30,
+        f"{emoji} <b>RESULT — {label}</b>",
+        "─" * 30,
+        f"{dir_e} <b>{rec.symbol}</b> {rec.direction} · {rec.style.upper()} · {rec.strategy or ''}",
+    ]
+    if outcome == "NOFILL":
+        lines += ["", "Price never reached the entry zone — no trade, no P&L.",
+                  "(We only count trades that actually filled.)"]
+    else:
+        lines += [
+            "",
+            f"📍 Entry: ${_fmt(rec.fill_price or rec.price_at_signal)}   Exit: ${_fmt(exit_price)}",
+            f"💰 Result: <b>{sign}{r_mult:.2f}R</b>  ({sign}{pnl:.2f}%)",
+            f"⏱ Duration: {_elapsed(rec)}",
+        ]
+        if rec.highest_tp_hit:
+            lines.append(f"🔄 Scaled exits: {rec.highest_tp_hit} reached, remainder trailed")
+    tag = "WIN" if r_mult > 0.05 else ("LOSS" if r_mult < -0.05 else "FLAT")
+    lines += ["─" * 30, f"#RESULT #{outcome} #{rec.symbol.replace('/', '')} #{tag}"]
+    return "\n".join(lines)
+
+
+async def _post(text: str):
     import time
     now = time.time()
     _results_this_hour[:] = [t for t in _results_this_hour if now - t < 3600]
     if len(_results_this_hour) >= MAX_RESULTS_PER_HOUR:
-        logger.debug("Result rate limit reached — result card suppressed.")
         return
     await send_result(text)
     _results_this_hour.append(now)
 
 
-# ── Telegram result / trailing notification ────────────────────────────────────
-
-def _fmt_price(value: Optional[float]) -> str:
-    if value is None: return "N/A"
-    if value >= 1000:   return f"{value:,.2f}"
-    elif value >= 1:    return f"{value:.4f}"
-    elif value >= 0.01: return f"{value:.5f}"
-    else:               return f"{value:.8f}"
-
-
-def _elapsed(rec: SignalRecord) -> str:
-    created = rec.created_at
-    if not created: return "?"
-    if created.tzinfo is None:
-        created = created.replace(tzinfo=timezone.utc)
-    delta = datetime.now(timezone.utc) - created
-    total_min = int(delta.total_seconds() / 60)
-    if total_min < 60: return f"{total_min}m"
-    h, m = divmod(total_min, 60)
-    return f"{h}h {m}m"
-
-
-def _build_result_message(rec: SignalRecord, outcome: str, exit_price: float, profit_pct: float) -> str:
-    is_win  = outcome in ("TP1", "TP2", "TP3")
-    is_expr = outcome == "EXPIRED"
-
-    emoji_map = {"TP3": "🏆", "TP2": "✅", "TP1": "✅", "SL": "❌", "EXPIRED": "⏰"}
-    label_map = {
-        "TP3": "FULL TARGET HIT", "TP2": "TARGET 2 HIT",
-        "TP1": "TARGET 1 HIT",   "SL":  "STOPPED OUT", "EXPIRED": "SIGNAL EXPIRED",
-    }
-    result_emoji = emoji_map.get(outcome, "⚪")
-    result_label = label_map.get(outcome, outcome)
-    dir_emoji    = "🟢" if rec.direction == "LONG" else "🔴"
-    style_emoji  = "⚡" if rec.style == "scalp" else "📈"
-    sign         = "+" if profit_pct >= 0 else ""
-    pnl_emoji    = "💚" if profit_pct >= 0 else "🔴"
-
-    # SL with trailing: might actually be profitable
-    if outcome == "SL" and profit_pct > 0:
-        footer_msg = "🟢 Stopped out in profit (trailing stop)."
-    elif is_win:
-        footer_msg = "🟢 Profitable trade!"
-    elif is_expr:
-        footer_msg = "⏰ Expired without hitting TP or SL."
-    else:
-        footer_msg = "🔴 Stopped out. Risk managed."
-
-    # Show if trailing stop was active
-    trail_info = ""
-    if rec.highest_tp_hit:
-        trail_info = f"\n🔄 Trailing: {rec.highest_tp_hit} was hit, SL was trailed"
-    if rec.adjusted_sl and rec.adjusted_sl != rec.stop_loss:
-        trail_info += f"\n🛡 Adjusted SL: ${_fmt_price(rec.adjusted_sl)}"
-
-    return "\n".join([
-        "─" * 32,
-        f"{result_emoji} <b>SIGNAL RESULT — {outcome}</b>",
-        "─" * 32,
-        "",
-        f"📊 <b>{rec.symbol}</b>  ·  {rec.exchange.upper()}  ·  {rec.market_type.upper()}",
-        f"{dir_emoji} {rec.direction}  |  {style_emoji} {rec.style.upper()}  |  Conf: {rec.confidence:.0f}%",
-        "",
-        f"<b>{result_label}</b>  {result_emoji}",
-        "",
-        f"📍 Entry:    ${_fmt_price(rec.price_at_signal)}",
-        f"📍 Exit:     ${_fmt_price(exit_price)}",
-        f"{pnl_emoji} P&amp;L:     <b>{sign}{profit_pct:.2f}%</b>",
-        f"⏱ Duration: {_elapsed(rec)}",
-        "",
-        f"🎯 TP1 ${_fmt_price(rec.tp1)}  TP2 ${_fmt_price(rec.tp2)}  TP3 ${_fmt_price(rec.tp3)}",
-        f"🛡 SL ${_fmt_price(rec.stop_loss)}",
-        trail_info,
-        "",
-        footer_msg,
-        "─" * 32,
-        f"#RESULT #{outcome} #{rec.symbol.replace('/', '')} #{'WIN' if is_win or profit_pct > 0 else 'LOSS'}",
-    ])
-
-
-def _build_trailing_notification(rec: SignalRecord, trail_type: str, new_sl: float) -> str:
-    """Build a short notification for trailing stop moves."""
-    dir_emoji = "🟢" if rec.direction == "LONG" else "🔴"
-
-    if trail_type == "TRAIL_BE":
-        label = "SL → BREAK-EVEN"
-        detail = "Risk eliminated! 🔒"
-    elif trail_type == "TRAIL_TP1":
-        label = "TP1 HIT — SL TRAILED"
-        detail = "Profit locked! 🎯"
-    elif trail_type == "TRAIL_TP2":
-        label = "TP2 HIT — SL → TP1"
-        detail = "Major profit secured! 🏆"
-    else:
-        label = "SL ADJUSTED"
-        detail = ""
-
-    return "\n".join([
-        "─" * 32,
-        f"🔄 <b>{label}</b>",
-        "─" * 32,
-        f"{dir_emoji} <b>{rec.symbol}</b>  ·  {rec.direction}  ·  {rec.style.upper()}",
-        f"🛡 New SL: <b>${_fmt_price(new_sl)}</b>",
-        f"📍 Entry: ${_fmt_price(rec.price_at_signal)}",
-        detail,
-        "─" * 32,
-    ])
-
-
-# ── Main tracking loop ─────────────────────────────────────────────────────────
+# ── Main loop ─────────────────────────────────────────────────────────────────
 
 async def check_open_signals():
-    open_signals = _get_open_signals()
+    open_signals = _get_open()
     if not open_signals:
-        logger.debug("Outcome tracker: no open signals.")
         return
 
     now = datetime.now(timezone.utc)
 
-    # ── Step 1: Split into stale vs active ────────────────────────────────────
-    stale_ids = []
-    active    = []
-
     for rec in open_signals:
-        created = rec.created_at
-        if created and created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-
-        expiry_h = EXPIRY_HOURS.get(rec.style, 4)
-        if created and (now - created) > timedelta(hours=expiry_h):
-            stale_ids.append(rec.id)
-        else:
-            active.append(rec)
-
-    if stale_ids:
-        _bulk_expire_old_signals(stale_ids)
-        logger.info(f"Outcome tracker: {len(stale_ids)} stale signals expired, "
-                    f"{len(active)} active signals to monitor.")
-
-    if not active:
-        return
-
-    logger.debug(f"Outcome tracker: checking {len(active)} active signal(s)...")
-
-    # ── Step 2: Check active signals ──────────────────────────────────────────
-    for rec in active:
         try:
-            price = await _get_current_price(rec.exchange, rec.symbol, rec.market_type)
-            if price is None:
+            created = _aware(rec.created_at)
+            since = _aware(rec.last_checked_at) or created
+            candles = await _get_candles_since(rec, since)
+            if candles is None or candles.empty:
+                _update(rec.id, last_checked_at=now)
                 continue
 
-            result = _check_trailing_and_levels(price, rec)
-            if result is None:
-                continue
+            status = rec.status or ("ACTIVE" if rec.fill_price else "PENDING")
 
-            # Handle trailing stop moves (not a close — just SL adjustment)
-            if result.startswith("TRAIL_"):
-                _apply_trailing_move(rec.id, result, rec)
+            # ── PENDING: look for a fill ─────────────────────────────────────
+            if status == "PENDING":
+                fill_idx, fill_price = _walk_pending(rec, candles)
 
-                # Send notification for TP hits (not for break-even, too noisy)
-                if result in ("TRAIL_TP1", "TRAIL_TP2") and _is_within_notify_window(rec):
-                    # Get the new SL after the trailing move
-                    with SessionLocal() as db:
-                        updated_rec = db.get(SignalRecord, rec.id)
-                        new_sl = updated_rec.adjusted_sl if updated_rec else rec.price_at_signal
-                    msg = _build_trailing_notification(rec, result, new_sl)
-                    await _send_result_guarded(msg)
-                continue
+                if fill_idx == "NOFILL_TP":
+                    _close(rec, "NOFILL", rec.price_at_signal)
+                    await _post(_result_msg(rec, "NOFILL", rec.price_at_signal, 0, 0))
+                    continue
 
-            # Handle definitive closes (TP3, SL)
-            pnl = _calc_profit(result, rec)
-            _close_signal_in_db(rec.id, result, price, pnl)
+                if fill_idx is None:
+                    expiry = FILL_EXPIRY_HOURS.get(rec.style, 4)
+                    if created and (now - created) > timedelta(hours=expiry):
+                        _close(rec, "NOFILL", rec.price_at_signal)
+                    else:
+                        _update(rec.id, last_checked_at=now)
+                    continue
 
-            if _is_within_notify_window(rec):
-                if result == "SL":
-                    logger.debug(f"Signal #{rec.id} closed silently (SL hit).")
-                else:
-                    msg = _build_result_message(rec, result, price, pnl)
-                    await _send_result_guarded(msg)
-            else:
-                logger.debug(f"Signal #{rec.id} closed silently (outside notify window).")
+                # Filled
+                filled_at = candles.index[fill_idx].to_pydatetime()
+                _update(rec.id, status="ACTIVE", fill_price=fill_price, filled_at=filled_at)
+                rec.status, rec.fill_price, rec.filled_at = "ACTIVE", fill_price, filled_at
+                candles = candles.iloc[fill_idx:]
+                status = "ACTIVE"
+
+            # ── ACTIVE: walk levels ──────────────────────────────────────────
+            if status == "ACTIVE":
+                state = {
+                    "fill_price": rec.fill_price or rec.price_at_signal,
+                    "highest_tp_hit": rec.highest_tp_hit,
+                    "adjusted_sl": rec.adjusted_sl,
+                    "mfe": rec.mfe_pct or 0.0,
+                    "mae": rec.mae_pct or 0.0,
+                }
+                outcome, exit_price = _walk_active(rec, candles, state)
+
+                # persist trailing / excursion state
+                _update(rec.id, highest_tp_hit=state["highest_tp_hit"],
+                        adjusted_sl=state["adjusted_sl"],
+                        mfe_pct=round(state["mfe"], 3), mae_pct=round(state["mae"], 3),
+                        last_checked_at=now)
+                rec.highest_tp_hit = state["highest_tp_hit"]
+                rec.adjusted_sl = state["adjusted_sl"]
+
+                if outcome:
+                    r_mult, pnl = _close(rec, outcome, exit_price)
+                    await _post(_result_msg(rec, outcome, exit_price, r_mult, pnl))
+                    continue
+
+                # Trade expiry: force-close at market
+                started = _aware(rec.filled_at) or created
+                expiry = TRADE_EXPIRY_HOURS.get(rec.style, 48)
+                if started and (now - started) > timedelta(hours=expiry):
+                    price = await fetch_ticker_price(rec.exchange, rec.symbol, rec.market_type)
+                    if price:
+                        r_mult, pnl = _close(rec, "EXPIRED", price)
+                        await _post(_result_msg(rec, "EXPIRED", price, r_mult, pnl))
 
         except Exception as e:
-            logger.error(f"Outcome tracker error for signal #{rec.id} ({rec.symbol}): {e}")
-
-    logger.debug("Outcome tracker: check complete.")
+            logger.error(f"Outcome tracker error #{rec.id} ({rec.symbol}): {e}")

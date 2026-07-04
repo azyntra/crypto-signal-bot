@@ -24,7 +24,8 @@ _feature_names = None
 
 FEATURE_KEYS = [
     "rsi", "macd_hist", "adx", "atr_pct", "vol_ratio",
-    "stoch_k", "stoch_d", "bb_width",
+    "stoch_k", "stoch_d", "bb_width", "bbw_pctile", "atr_pctile",
+    "mfi", "cmf", "ema200_slope", "bb_pct",
 ]
 
 CATEGORICAL_FEATURES = {
@@ -32,16 +33,15 @@ CATEGORICAL_FEATURES = {
     "ema_bear": lambda ind: 1 if ind.get("ema_bear") else 0,
     "above_200": lambda ind: 1 if ind.get("above_200") is True else (0 if ind.get("above_200") is False else 0.5),
     "above_vwap": lambda ind: 1 if ind.get("above_vwap") is True else (0 if ind.get("above_vwap") is False else 0.5),
-    "trending": lambda ind: 1 if ind.get("trending") else 0,
+    "supertrend_bull": lambda ind: 1 if ind.get("supertrend_dir") == 1 else 0,
     "vol_spike": lambda ind: 1 if ind.get("vol_spike") else 0,
     "obv_rising": lambda ind: 1 if ind.get("obv_rising") is True else (0 if ind.get("obv_rising") is False else 0.5),
     "structure_bull": lambda ind: 1 if ind.get("structure_bull") else 0,
     "structure_bear": lambda ind: 1 if ind.get("structure_bear") else 0,
-    "regime_trending": lambda ind: 1 if ind.get("market_regime") == "trending" else 0,
-    "regime_ranging": lambda ind: 1 if ind.get("market_regime") == "ranging" else 0,
-    "regime_choppy": lambda ind: 1 if ind.get("market_regime") == "choppy" else 0,
+    "bull_engulf": lambda ind: 1 if ind.get("bull_engulf") else 0,
+    "bear_engulf": lambda ind: 1 if ind.get("bear_engulf") else 0,
     "is_long": lambda ind: 1 if ind.get("_direction") == "LONG" else 0,
-    "is_scalp": lambda ind: 1 if ind.get("_style") == "scalp" else 0,
+    "is_intraday": lambda ind: 1 if ind.get("_style") == "intraday" else 0,
 }
 
 
@@ -92,7 +92,7 @@ def train_model(min_signals: int = ML_MIN_TRAINING_SIGNALS) -> Optional[dict]:
     with SessionLocal() as db:
         records = db.query(SignalRecord).filter(
             SignalRecord.outcome.isnot(None),
-            SignalRecord.outcome != "EXPIRED",
+            SignalRecord.outcome.notin_(("EXPIRED", "NOFILL")),
             SignalRecord.indicators_json.isnot(None),
         ).all()
         db.expunge_all()
