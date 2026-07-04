@@ -12,6 +12,7 @@ vs v2:
   - Charts attached to signals.
 """
 import asyncio
+from collections import Counter
 from typing import Optional
 
 from src.data.fetcher import (
@@ -90,52 +91,52 @@ async def _global_guards(scan_name: str) -> Optional[dict]:
 
 # ── Per-symbol processing ─────────────────────────────────────────────────────
 
-async def _process_symbol(exchange: str, symbol: str, style: str, btc: dict):
+async def _process_symbol(exchange: str, symbol: str, style: str, btc: dict) -> str:
+    """Returns a funnel stage label describing where this symbol stopped."""
     tfs = INTRADAY_TIMEFRAMES if style == "intraday" else SWING_TIMEFRAMES
     entry_tf, htf_tf, regime_tf = tfs[0], tfs[1], tfs[2] if len(tfs) > 2 else tfs[1]
 
     data = await fetch_multi_timeframe(exchange, symbol, tfs, MARKET_TYPE)
     if entry_tf not in data or regime_tf not in data:
-        return
+        return "no_data"
 
     ind_entry = compute_indicators(data[entry_tf])
     ind_htf = compute_indicators(data.get(htf_tf))
     ind_regime = compute_indicators(data.get(regime_tf)) if regime_tf != htf_tf else ind_htf
     if not ind_entry or not ind_regime:
-        return
+        return "no_indicators"
 
     # 1. Regime gate
     regime = classify_regime(ind_regime, ind_htf)
     if regime == "choppy":
-        return
+        return "choppy_regime"
 
     # 2. Strategy evaluation (hard gates inside)
     cand = evaluate(ind_entry, ind_htf, regime)
     if not cand:
-        return
+        return f"no_trigger({regime})"
 
     # 3. BTC filter
     block = btc_blocks_direction(btc, cand["direction"])
     if block:
-        logger.debug(f"{symbol} {cand['direction']} blocked: {block}")
-        return
+        logger.info(f"{symbol} {cand['direction']} blocked by BTC filter: {block}")
+        return "btc_blocked"
 
     # 4. Build signal (SL/TP/entry zone/R:R)
     signal = validate_and_build(cand, style)
     if not signal:
-        return
+        logger.info(f"{symbol} {cand['direction']} [{cand['strategy']}] failed validation (SL/TP/R:R)")
+        return "failed_validation"
 
     # 5. Cross-exchange dedup + caps
     if is_duplicate(symbol, signal["direction"], style, DEDUP_WINDOW_MIN.get(style, 120)):
-        return
+        return "duplicate"
     if count_open_signals() >= MAX_OPEN_SIGNALS:
-        logger.debug("Max open signals reached")
-        return
+        return "max_open_signals"
     if count_open_signals(symbol) >= MAX_OPEN_PER_SYMBOL:
-        return
+        return "max_open_per_symbol"
     if count_signals_last_hour() >= MAX_SIGNALS_PER_HOUR:
-        logger.debug("Hourly signal rate limit reached")
-        return
+        return "hourly_rate_limit"
 
     # 6. Funding-rate crowding penalty (futures)
     if FUNDING_ENABLED:
@@ -153,7 +154,7 @@ async def _process_symbol(exchange: str, symbol: str, style: str, btc: dict):
     signal["ml_win_prob"] = ml_prob
     if ml_prob < ML_MIN_WIN_PROB:
         logger.info(f"{symbol} dropped: ML win prob {ml_prob:.2f} < {ML_MIN_WIN_PROB}")
-        return
+        return "ml_rejected"
 
     # 8. Sentiment bias
     sentiment = get_fear_greed_index()
@@ -169,14 +170,14 @@ async def _process_symbol(exchange: str, symbol: str, style: str, btc: dict):
                                     sentiment, regime, btc.get("regime"))
     if ai_review.get("action") == "REJECT":
         logger.info(f"{symbol} {signal['direction']} rejected by AI: {ai_review.get('reasoning')}")
-        return
+        return "ai_rejected"
     signal["confidence"] = min(signal["confidence"], ai_review.get("adjusted_confidence", signal["confidence"]))
     signal["ai_reasoning"] = ai_review.get("reasoning", "")
 
     # 11. Final confidence gate
     if signal["confidence"] < MIN_CONFIDENCE:
-        logger.debug(f"{symbol} dropped: final confidence {signal['confidence']} < {MIN_CONFIDENCE}")
-        return
+        logger.info(f"{symbol} dropped: final confidence {signal['confidence']} < {MIN_CONFIDENCE}")
+        return "low_confidence"
 
     # 12. Publish (with chart if enabled)
     text = format_signal(signal, symbol, exchange, style, entry_tf, MARKET_TYPE, regime)
@@ -192,6 +193,7 @@ async def _process_symbol(exchange: str, symbol: str, style: str, btc: dict):
                 msg_id, ai_review, regime, btc.get("regime"))
     logger.info(f"✅ {style} signal: {symbol} {signal['direction']} "
                 f"[{signal['strategy']}] conf={signal['confidence']}%")
+    return "published"
 
 
 # ── Scan entry points ─────────────────────────────────────────────────────────
@@ -204,13 +206,17 @@ async def _run_scan(style: str):
 
     logger.info(f"═══ {name} started (BTC regime: {btc.get('regime')}) ═══")
     sem = asyncio.Semaphore(SCAN_CONCURRENCY)
+    funnel: Counter = Counter()
+    errors: dict[str, str] = {}
 
     async def worker(exchange, symbol):
         async with sem:
             try:
-                await _process_symbol(exchange, symbol, style, btc)
+                funnel[await _process_symbol(exchange, symbol, style, btc) or "unknown"] += 1
             except Exception as e:
-                logger.debug(f"{style} error {symbol}: {e}")
+                funnel["error"] += 1
+                if len(errors) < 3:
+                    errors[symbol] = f"{type(e).__name__}: {e}"
 
     for exchange in SCAN_EXCHANGES:
         try:
@@ -219,7 +225,10 @@ async def _run_scan(style: str):
         except Exception as e:
             logger.error(f"{name} failed [{exchange}]: {e}")
 
-    logger.info(f"═══ {name} complete ═══")
+    summary = " | ".join(f"{k}:{v}" for k, v in funnel.most_common()) or "no pairs scanned"
+    logger.info(f"═══ {name} complete — funnel: {summary} ═══")
+    if errors:
+        logger.warning(f"{name} worker errors (first {len(errors)}): {errors}")
 
 
 async def run_intraday_scan():
